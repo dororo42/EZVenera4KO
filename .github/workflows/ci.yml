@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test deps (lupa = LuaJIT 2.1, same as KOReader)
+        run: pip install "lupa==2.8.*"   # L14：钉次版本，防上游破坏测试基线
+
+      - name: Install OpenSSL dev headers/libs (real-vector crypto tests, review M1/M7)
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+
+      - name: Lua syntax check (all plugin modules)
+        run: python scripts/check_syntax.py
+
+      - name: Unit tests
+        run: python scripts/run_tests.py
+
+      - name: No hold-dependency check (ADR-005, Kindle 4 red line)
+        run: python scripts/check_no_hold.py
+
+      - name: Vendored init.js integrity (ADR-002)
+        run: python scripts/verify_vendored.py
+
+      - name: Rust bridge skeleton compiles (no vendored quickjs yet — check only)
+        run: |
+          cd rust/ezvjs-bridge && cargo check   # L14：用 runner 自带 stable，不主动 update
+
+  # 引擎真机构建需要 koxtoolchain（Linux/WSL），CI 中仅验证脚本语法与文档一致性
+  engine-build-dryrun:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shell scripts pass bash -n
+        run: |
+          for f in scripts/*.sh; do
+            bash -n "$f" && echo "OK $f" || exit 1
+          done

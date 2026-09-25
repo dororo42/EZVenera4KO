@@ -1,0 +1,22 @@
+# 行尾策略：默认按内容自动判定文本，检出时用平台换行（Windows 工作区 CRLF）。
+* text=auto
+
+# ADR-002：vendor 文件的 sha256 是对「字节」签的，不是对「逻辑行」签的。
+# core.autocrlf 在 add 时把 CRLF 压成 LF，会让仓库 blob 与工作区文件差 1519 字节，
+# CI 校验的是检出后的 blob → 哈希必然对不上。这两行把 vendor 锁成 LF，两边逐字节一致。
+src/koreader-plugin/ezvenera.koplugin/vendored/init.js text eol=lf
+src/koreader-plugin/ezvenera.koplugin/vendored/init.js.sha256 text eol=lf
+
+# 二进制禁止任何换行改写（引擎 .so 一旦恢复入仓也走这里）
+*.so binary
+*.dll binary
+*.dylib binary
+*.apk binary
+*.zip binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ttf binary
+*.otf binary
+*.ico binary
