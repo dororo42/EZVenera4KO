@@ -1,5 +1,5 @@
 -- unit test: browser.lua 阅读器内的章节导航（上一章 / 目录 / 下一章）
--- 关注点：导航条是叠在 ImageViewer 之上的独立窗口，所以①三键都是普通
+-- 关注点：导航条是叠在 ImageViewer 之上的独立窗口，所以①四键都是普通
 -- callback（ADR-005 禁 hold）、②换章要先把上一章的阅读器与导航条收干净、
 -- ③阅读器关闭时导航条不能留在屏幕上、④离线只下过两章时也能前后跳。
 -- browser.lua 顶层 require KOReader 前端模块 → 测试环境先桩化。
@@ -12,7 +12,7 @@ end
 
 local fake = {
     shown = {}, closed = {}, scheduled = {}, pb = {}, viewer = nil,
-    viewer_args = nil, bars = {}, button_tables = {},
+    viewer_args = nil, bars = {}, button_tables = {}, vgs = {},
 }
 
 stub("logger", { warn = noop, info = noop, err = noop, dbg = noop, verbose = noop })
@@ -68,6 +68,17 @@ stub("ui/widget/container/bottomcontainer", {
 })
 stub("ui/widget/container/framecontainer", {
     new = function(_, args) return { __frame = true, args = args } end,
+})
+-- 导航条现在是「页码条 + 四键」两行的 VerticalGroup。本文件不测页码条
+-- （它没桩化 horizontalscrollbar 等模块，_readerPageBar 会走 pcall 降级），
+-- 桩只要留住真正的子控件列表。形状照上游：Widget:new(o) 把入参表变成实例
+-- （widget.lua:40-41），browser 之后还会 table.insert(rows, 1, 页码条)。
+stub("ui/widget/verticalgroup", {
+    new = function(_, args)
+        args.__vg = true
+        table.insert(fake.vgs, args)
+        return args
+    end,
 })
 stub("ui/widget/buttontable", {
     new = function(_, args)
@@ -144,7 +155,7 @@ local function makeBrowser()
     }
     fake.shown, fake.closed, fake.scheduled, fake.pb = {}, {}, {}, {}
     fake.viewer, fake.viewer_args = nil, nil
-    fake.bars, fake.button_tables = {}, {}
+    fake.bars, fake.button_tables, fake.vgs = {}, {}, {}
     b = Browser.new{ infoMessage = noop, netclient = net, downloader = dl }
     b.cookies = { headerFor = function() return nil end }
     b._hasMember = function() return false end
@@ -183,7 +194,7 @@ local function downloadAll(b, ep)
     return out
 end
 
---- 最近一条导航条上的三个按钮
+--- 最近一条导航条上的四个按钮
 local function navButtons()
     local args = fake.button_tables[#fake.button_tables]
     assert(args, "nav bar button table shown")
@@ -208,15 +219,16 @@ local function countClosed(w)
     return n
 end
 
--- 导航条：三个普通 callback（无 hold 依赖），并且确实盖在阅读器之上
-function tests.nav_bar_has_three_plain_callbacks()
+-- 导航条：四个普通 callback（无 hold 依赖），并且确实盖在阅读器之上
+function tests.nav_bar_has_four_plain_callbacks()
     local b = makeBrowser()
     b:showReader("baozi", "c1", "7", "航海王", "第7话")
     local btns = navButtons()
-    assert_eq("3 buttons", 3, #btns)
+    assert_eq("4 buttons", 4, #btns)
     assert_eq("prev label", "上一章", btns[1].text)
     assert_eq("toc label", "目录", btns[2].text)
-    assert_eq("next label", "下一章", btns[3].text)
+    assert_eq("save label", "存图", btns[3].text)
+    assert_eq("next label", "下一章", btns[4].text)
     for i, btn in ipairs(btns) do
         assert_eq("button " .. i .. " plain callback", "function",
             type(btn.callback))
@@ -268,7 +280,7 @@ end
 function tests.new_chapter_strip_forwards_to_the_new_reader()
     local b = makeBrowser()
     b:showReader("baozi", "c1", "7", "航海王", "第7话")
-    navButtons()[3].callback()
+    navButtons()[4].callback()
     assert_eq("a second strip was built", 2, #fake.bars)
     local new_bar, new_viewer = fake.bars[2], fake.viewer
     assert_eq("new strip hands over to the new reader", true,
@@ -284,7 +296,7 @@ function tests.next_chapter_reopens_on_the_next_one()
     b:showReader("baozi", "c1", "7", "航海王", "第7话")
     local old_viewer, old_bar = fake.viewer, fake.bars[1]
     fake.closed = {}
-    navButtons()[3].callback()
+    navButtons()[4].callback()
     assert_eq("old reader closed", 1, countClosed(old_viewer))
     assert_eq("old nav bar closed", 1, countClosed(old_bar))
     assert_eq("next chapter opened", "第8话", fake.viewer_args.title_text)
@@ -322,7 +334,7 @@ function tests.toc_positions_on_current_chapter_and_jumps()
     return true
 end
 
--- 阅读器关闭（标题栏 X、下滑）时导航条必须一起消失：否则三条按钮会留在
+-- 阅读器关闭（标题栏 X、下滑）时导航条必须一起消失：否则底部那条带会留在
 -- 上一层界面之上，点了没反应
 function tests.closing_reader_disposes_nav_bar()
     local b = makeBrowser()
@@ -341,12 +353,12 @@ function tests.offline_nav_falls_back_to_downloaded_chapters()
     assert_eq("chapter 7 downloaded", true, downloadAll(b, "7").ok)
     assert_eq("chapter 8 downloaded", true, downloadAll(b, "8").ok)
     fake.shown, fake.closed, fake.viewer, fake.viewer_args = {}, {}, nil, nil
-    fake.bars, fake.button_tables = {}, {}
+    fake.bars, fake.button_tables, fake.vgs = {}, {}, {}
     b.broken = true
     b.info_calls, b.ep_calls = 0, 0
     b:showReader("baozi", "c1", "7", "航海王", "第7话")
     assert_eq("offline open is silent", 0, b.info_calls + b.ep_calls)
-    navButtons()[3].callback()
+    navButtons()[4].callback()
     assert_eq("switched to a downloaded chapter", "第8话",
         fake.viewer_args.title_text)
     assert_eq("first press tries the source once", 1, b.info_calls)
@@ -367,7 +379,7 @@ function tests.chapters_from_detail_are_reused()
     b:showDetail("baozi", { id = "c1", title = "航海王" })
     assert_eq("detail fetched chapters once", 1, b.info_calls)
     b:showReader("baozi", "c1", "7", "航海王", "第7话")
-    navButtons()[3].callback()
+    navButtons()[4].callback()
     assert_eq("still no second loadInfo", 1, b.info_calls)
     assert_eq("one loadEp per chapter", 2, b.ep_calls)
     assert_eq("now on chapter 8", "第8话", fake.viewer_args.title_text)

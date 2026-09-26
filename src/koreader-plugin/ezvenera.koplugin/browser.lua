@@ -41,6 +41,8 @@ function Browser.new(deps)
     o.page_bb_bytes = deps.page_bb_bytes
     -- 离线下载根目录（单测注入临时目录；真机走 DataStorage）
     o.downloads_dir = deps.downloads_dir
+    -- 「另存本页」的落盘根目录（同一套注入方式，见 savedBasedir）
+    o.saved_dir = deps.saved_dir
     -- 直接注入下载器（单测给内存 fs；真机不传，见 getDownloader）
     o.downloader = deps.downloader
     return o
@@ -1539,6 +1541,190 @@ end
 --- Show/CloseWidget 等生命周期事件由 UIManager 直接投递，转交会重复渲染。
 local pass_through_ges = { onGesture = true }
 
+--- 进度条位置 → 页码。上游 HorizontalScrollBar 给的比例**不钳制**
+--- （v2026.07.1 horizontalscrollbar.lua:78 就是 `(ges.pos.x - x) / width`，
+--- 手指拖出轨道外会拿到负数或 > 1），所以钳制与分段映射归我们这边。
+-- 轨道按 N 等分：落在第 k 段即第 k+1 页，与 _pageThumb 的画法一一对应。
+function Browser:_pageFromRatio(ratio, total)
+    if type(total) ~= "number" or total < 1 then return nil end
+    if type(ratio) ~= "number" then return nil end
+    if ratio < 0 then ratio = 0 elseif ratio > 1 then ratio = 1 end
+    local pn = math.floor(ratio * total) + 1
+    return pn > total and total or pn
+end
+
+--- 页码 → 滑块区间（0..1 的「可见窗口」）。上游 set() 自己会把 low 的下界
+--- 收成 0、high 的上界放开（horizontalscrollbar.lua:99-102），单页就是 1/N 宽。
+function Browser:_pageThumb(pn, total)
+    if type(total) ~= "number" or total < 1 then return 0, 1 end
+    if type(pn) ~= "number" or pn < 1 then pn = 1 end
+    if pn > total then pn = total end
+    return (pn - 1) / total, pn / total
+end
+
+function Browser:_pageLabel(pn, total)
+    return _("第 ") .. tostring(pn) .. " / " .. tostring(total) .. _(" 页")
+end
+
+--- 章内底部页码条：【第 N / M 页】+ 可拉的进度条（上游 HorizontalScrollBar，
+--- v2026.07.1 起 tap/hold/hold_pan/pan 与两种 release 都汇到同一个 ratio 回调，
+--- 见 horizontalscrollbar.lua:76-90 的别名表）。
+-- on_go(pn) 才真的翻页：拖动过程中 pan 每 0.2s 就来一次，一路都去跳页等于
+-- 连串同步取页（单页最坏 6s），必然踩安卓 5s ANR —— 所以中途只改显示，
+-- 按下/抬起才跳。返回 { group = 布局控件, paint = 真实页变化时调用 }。
+function Browser:_readerPageBar(total, on_go, invalidate)
+    local Device = require("device")
+    local CenterContainer = require("ui/widget/container/centercontainer")
+    local Geom = require("ui/geometry")
+    local HorizontalGroup = require("ui/widget/horizontalgroup")
+    local HorizontalSpan = require("ui/widget/horizontalspan")
+    local ScrollBar = require("ui/widget/horizontalscrollbar")
+    local TextWidget = require("ui/widget/textwidget")
+    local Font = require("ui/font")
+
+    local span = 8
+    local screen_w = Device.screen:getWidth()
+    -- TextWidget 必须显式给 face：它默认 face=nil，updateSize 里
+    -- Font:getAdjustedFace(self.face) 会直接取 face.is_real_bold
+    -- （v2026.07.1 textwidget.lua:102 + font.lua:385-386）→ 报错。
+    -- 真机上这条 pcall 里报错 = 整页码条被静默降级掉，什么都看不见。
+    -- pgfont 是上游「分页显示」专用字体（font.lua:44 注释 + sizemap:93=20）。
+    local face = Font:getFace("pgfont")
+    -- 文本格按「最宽的那一版」预留：HorizontalGroup 的子控件偏移只在第一次
+    -- getSize() 时算一次（horizontalgroup.lua:15-38），页码变长就把进度条挤位。
+    local probe = TextWidget:new{ text = self:_pageLabel(total, total), face = face }
+    local psz = probe:getSize()
+    local lbl_w, lbl_h = psz.w, psz.h
+    probe:free()
+    local label = TextWidget:new{ text = self:_pageLabel(1, total), face = face }
+    local bar = ScrollBar:new{
+        width = screen_w - 3 * span - lbl_w,
+        height = math.max(10, math.floor(lbl_h / 2)),
+    }
+    -- 上游的初值是 low=0 / high=1（v2026.07.1 horizontalscrollbar.lua:12-13），
+    -- 不先 set 一次的话第一帧的「滑块」铺满整条轨道，看着就是一条实心条。
+    bar:set(self:_pageThumb(1, total))
+    local group = HorizontalGroup:new{
+        HorizontalSpan:new{ width = span },
+        CenterContainer:new{
+            dimen = Geom:new{ x = 0, y = 0, w = lbl_w, h = lbl_h },
+            label,
+        },
+        HorizontalSpan:new{ width = span },
+        bar,
+        HorizontalSpan:new{ width = span },
+    }
+    -- shown = 条上此刻显示的页，real = 阅读器真正在显示的页（预览时两者不同）
+    local shown, real = 1, 1
+    -- 返回值：页码真的变了才要重绘。取页路径每次都会调 paint，无脑标脏等于
+    -- 每翻一次屏就多刷一条导航条（墨水屏上是一次肉眼可见的闪）。
+    local function display(pn)
+        if pn == shown then return false end
+        shown = pn
+        label:setText(self:_pageLabel(pn, total))
+        bar:set(self:_pageThumb(pn, total))
+        return true
+    end
+    local function on_scroll(_, _, ges)
+        -- touch_dimen 由上游在 paintTo 里写（horizontalscrollbar.lua:106），
+        -- 首帧之前没有 → 这一趟什么都不做，别拿 nil 去算。
+        local track = bar.touch_dimen
+        if not track or not ges or not ges.pos then return true end
+        local pn = self:_pageFromRatio((ges.pos.x - track.x) / bar.width, total)
+        if not pn then return true end
+        display(pn)
+        if ges.ges ~= "pan" and ges.ges ~= "hold_pan" then
+            -- tap / hold / hold_release / pan_release：跳到按下的那一页。
+            -- 落在当前页就不用跳，switchToImageNum 自己会直接返回。
+            if pn ~= real then on_go(pn) end
+        end
+        invalidate()
+        return true
+    end
+    -- 六个手势名逐个盖到实例上：上游在类里把它们别名成同一个函数，
+    -- 只改 onTapScroll 的话另外五个还是会走原实现。
+    for _, name in ipairs({ "onTapScroll", "onHoldScroll", "onHoldPanScroll",
+                            "onHoldReleaseScroll", "onPanScroll",
+                            "onPanScrollRelease" }) do
+        bar[name] = on_scroll
+    end
+    return {
+        group = group,
+        paint = function(pn)
+            real = pn
+            if display(pn) then invalidate() end
+        end,
+    }
+end
+
+--- 目录名 / 文件名：逐 UTF-8 码点保留可读字符，控制字符与路径保留字符换成 `_`。
+-- 不能套 Downloader 的 safeId：Lua 的 %w 只认 ASCII，中文书名会被压成一串
+-- 下划线。逐码点遍历还有一个作用 —— 按字节上限截断时不会把一个多字节字符
+-- 切成非法序列（这种名字在 ext4 上建得出来，拖到 Windows 就是乱码/建不上）。
+function Browser:_safeName(s, max_bytes)
+    local max = max_bytes or 80
+    local out, n = {}, 0
+    for cp in tostring(s or ""):gmatch("[\1-\127\192-\244][\128-\191]*") do
+        if n + #cp > max then break end
+        local bad = cp:match("[\1-\31/\\:*?\"<>|]")
+        out[#out + 1] = bad and "_" or cp
+        n = n + #cp
+    end
+    local name = table.concat(out)
+    -- 只剩分隔符替换出来的下划线：这种目录名等于没有名字，还容易互相撞上
+    if name:gsub("_", "") == "" then return "ezvenera" end
+    return name
+end
+
+--- 另存图片的根目录：与下载目录并列（真机 <dataDir>/ezvenera/saved，单测注入）。
+function Browser:savedBasedir()
+    if self.saved_dir then return self.saved_dir end
+    local ok, DataStorage = pcall(require, "datastorage")
+    if ok and DataStorage then
+        return DataStorage:getDataDir() .. "/ezvenera/saved"
+    end
+    return "ezvenera/saved"
+end
+
+--- 长按（按住不动再抬起）另存本页。上游把这一手势用成了「墨水屏全刷」：
+-- v2026.07.1 imageviewer.lua:637-652，抬起时位移 < pan_threshold 就
+-- UIManager:setDirty(nil, "full")，位移够大才平移画面。全刷在 KOReader 里
+-- 到处都有入口（菜单 → 刷新方式），长按对本插件基本是闲置的；带位移那一支
+-- 是缩放后的平移，必须原样保留。
+-- 起点自己在 onHold 里记，不用上游的 _pan_relative_*：onPan 会把那两个字段
+-- 改写成**增量**（:654-659），拖过一段再抬起时它们已经不是「按住点→抬起点」
+-- 的位移，拿来判断会把「拖完抬起」误认成长按。
+function Browser:_hookLongPressSave(viewer, on_save)
+    local base_hold, base_release = viewer.onHold, viewer.onHoldRelease
+    if type(base_hold) ~= "function" or type(base_release) ~= "function" then
+        -- 上游这两个 handler 不在（改了名 / 非触屏前端）就别盖：这里 return
+        -- false，调用方记一条日志，长按保持上游行为。
+        return false
+    end
+    local start
+    function viewer:onHold(_, ges)
+        start = (ges and ges.pos) and { x = ges.pos.x, y = ges.pos.y } or nil
+        return base_hold(self, _, ges)
+    end
+    function viewer:onHoldRelease(_, ges)
+        local moved
+        if start and ges and ges.pos then
+            moved = math.abs(ges.pos.x - start.x) >= self.pan_threshold
+                or math.abs(ges.pos.y - start.y) >= self.pan_threshold
+        else
+            -- 没记到起点就没有「按住不动」可断言，交回上游按平移处理
+            moved = true
+        end
+        start = nil
+        if moved then return base_release(self, _, ges) end
+        self._panning = false
+        self._pan_relative_x, self._pan_relative_y = 0, 0
+        guardCall("长按存图", on_save)
+        return true
+    end
+    return true
+end
+
 function Browser:showReader(key, comicId, epId, title, chapterTitle)
     local dl = self:getDownloader()
     -- 已下载 → 完全离线打开：一个网络请求都不发（无网/飞行模式也能读，
@@ -1637,17 +1823,27 @@ function Browser:showReader(key, comicId, epId, title, chapterTitle)
     local bb_order, bb_bytes = {}, 0
     local BB_BUDGET = self.page_bb_bytes or (12 * 1024 * 1024)
     local closed = false
+    -- 进度条跳页时置位：目标页没缓存就先把这一屏让给占位页 + 预取节拍，
+    -- 不在手势回调里同步下载（一次最坏 6s，连着拖几下必踩安卓 5s ANR）。
+    local defer_fetch = false
 
-    -- ---------- 章内导航（上一章 / 目录 / 下一章） ----------
+    -- ---------- 章内导航（上一章 / 目录 / 下一章 / 页码进度条） ----------
     -- ImageViewer 的 onTap/onSwipe/onMultiSwipe 全部 `return true`（真机装的
     -- v2026.07.1 imageviewer.lua 实证），手势根本不会向下传，标题栏也没有可挂
     -- 按钮的位置。所以照 ConfigDialog 的做法在它上面叠一条
     -- BottomContainer + ButtonTable：按钮各自的 GestureRange 命中才消费事件，
     -- 其余位置的 onGesture 返回 nil → 事件继续向下 → 阅读器照常点击翻页。
-    local viewer, nav_bar
+    local viewer, nav_bar, page_bar
+    -- 另存本页要碰预取队列（enqueueNow 在下面才声明），先占位再赋值。
+    local saveCurrentPage
+    --- 存「屏幕上正显示的这一页」：长按、【存图】键、外部动作三条入口共用。
+    local function saveShownPage()
+        saveCurrentPage(viewer and viewer._images_list_cur)
+    end
     local function closeNavBar()
         local bar = nav_bar
         nav_bar = nil
+        page_bar = nil
         self._reader_nav = nil
         if bar then UIManager:close(bar) end
     end
@@ -1655,6 +1851,31 @@ function Browser:showReader(key, comicId, epId, title, chapterTitle)
         local v = viewer
         viewer = nil
         if v then UIManager:close(v) end
+    end
+
+    --- 让导航条重绘。盖在阅读器之上的是独立窗口，改完子控件必须自己标脏，
+    -- 否则页码翻了条子还停在原位。区域用 BottomContainer:contentRange()
+    -- （v2026.07.1 bottomcontainer.lua:23 就是留给这个用途的内容区）。
+    local function repaintNavBar()
+        if not nav_bar then return end
+        pcall(function()
+            UIManager:setDirty(nav_bar, function()
+                return "ui", nav_bar:contentRange()
+            end)
+        end)
+    end
+
+    --- 进度条跳页。目标页没缓存时先给占位页、把下载交给预取节拍：
+    -- 手势回调里同步取页最坏 6s，正踩安卓的 5s 输入超时（见 IMG_OPTS 注释）。
+    local function jumpToPage(pn)
+        if not viewer or pn == viewer._images_list_cur then return end
+        if not cache[pn] then defer_fetch = true end
+        local ok, err = pcall(function() viewer:switchToImageNum(pn) end)
+        if not ok then
+            defer_fetch = false
+            logger.warn("ezvenera: jump to page " .. tostring(pn) .. " failed:",
+                tostring(err))
+        end
     end
 
     --- 章节表：命中详情的缓存 → 源调用 → 离线兜底（本书已下载的话）。
@@ -1772,8 +1993,39 @@ function Browser:showReader(key, comicId, epId, title, chapterTitle)
         local BottomContainer = require("ui/widget/container/bottomcontainer")
         local FrameContainer = require("ui/widget/container/framecontainer")
         local ButtonTable = require("ui/widget/buttontable")
+        local VerticalGroup = require("ui/widget/verticalgroup")
         local BBc = require("ffi/blitbuffer")
         local scr = Device.screen
+        -- 页码条要额外 require 六个前端控件模块。装不上（老版本 / 别的设备）
+        -- 就只留三键导航：不能因为一条进度条把整个导航条丢掉。
+        local okbar, bar = pcall(function()
+            return self:_readerPageBar(#images, jumpToPage, repaintNavBar)
+        end)
+        page_bar = okbar and bar or nil
+        if not okbar then
+            -- 降级可以，但绝不能静默：真机上「看不到进度条」查了半天才发现
+            -- 是这里报错被吞掉（2026-09-26）。
+            logger.warn("ezvenera: page bar unavailable, buttons only:",
+                tostring(bar))
+        end
+        local rows = VerticalGroup:new{
+            ButtonTable:new{
+                width = scr:getWidth(),
+                buttons = { {
+                    { text = _("上一章"),
+                      callback = function() stepChapter(-1) end },
+                    { text = _("目录"), callback = showToc },
+                    -- 与长按同效的备入口：ADR-005 要求所有入口都是普通
+                    -- callback，不能只有「按住」这一条路。
+                    { text = _("存图"), callback = saveShownPage },
+                    { text = _("下一章"),
+                      callback = function() stepChapter(1) end },
+                } },
+            },
+        }
+        if page_bar then
+            table.insert(rows, 1, page_bar.group)
+        end
         nav_bar = BottomContainer:new{
             dimen = scr:getSize(),
             FrameContainer:new{
@@ -1781,16 +2033,7 @@ function Browser:showReader(key, comicId, epId, title, chapterTitle)
                 bordersize = 0,
                 margin = 0,
                 padding = 0,
-                ButtonTable:new{
-                    width = scr:getWidth(),
-                    buttons = { {
-                        { text = _("上一章"),
-                          callback = function() stepChapter(-1) end },
-                        { text = _("目录"), callback = showToc },
-                        { text = _("下一章"),
-                          callback = function() stepChapter(1) end },
-                    } },
-                },
+                rows,
             },
         }
         -- 【真机踩到】盖在阅读器之上的顶层窗口会吞掉按钮区之外的全部点击，
@@ -1805,44 +2048,6 @@ function Browser:showReader(key, comicId, epId, title, chapterTitle)
         end
         UIManager:show(nav_bar)
         self._reader_nav = { step = stepChapter, toc = showToc }
-    end
-
-
-    -- 【临时探针·排查完删除】章节阅读期真机三次同签名 SIGSEGV（libluajit 内
-    -- lua_rawset 区段，进入章节 40-60s 后，无 Failed to run script 前导、无
-    -- lmkd kill）→ 需要进程内存曲线区分「分配耗尽」与「FFI/终值器破坏」。
-    -- 采样走 2s 自续节拍：一次复现不依赖翻页动作，静置也能出曲线。
-    local diag_n, diag_pn = 0, nil
-    local function diagSample(tag)
-        diag_n = diag_n + 1
-        local rss, hwm, peak = "?", "?", "?"
-        local okf, f = pcall(io.open, "/proc/self/status", "r")
-        if okf and f then
-            local okc, t = pcall(function() return f:read("*a") end)
-            f:close()
-            if okc and t then
-                rss = t:match("VmRSS:%s+(%d+)") or "?"
-                hwm = t:match("VmHWM:%s+(%d+)") or "?"
-                peak = t:match("VmPeak:%s+(%d+)") or "?"
-            end
-        end
-        local okl, luckb = pcall(collectgarbage, "count")
-        logger.warn("ezveneraDIAG", tag, " n=", diag_n, " pn=", tostring(diag_pn),
-            " rss_kb=", rss, " hwm_kb=", hwm, " peak_kb=", peak,
-            " lua_kb=", (okl and math.floor(luckb)) or "?",
-            " cache_kb=", math.floor(cache_bytes / 1024), " nb=", #images)
-    end
-    local function diag(pn)
-        diag_pn = pn
-        diagSample("page")
-    end
-    local function diagTick()
-        if closed then return end
-        guardCall("探针", function() diagSample("tick") end)
-        local ok = pcall(function()
-            UIManager:scheduleIn(2, diagTick)
-        end)
-        if not ok then logger.warn("ezveneraDIAG: tick schedule failed") end
     end
 
     -- 连续失败计数：一张取不到的图如果在每次重绘时都去撞 4s 的超时，翻页
@@ -1970,6 +2175,58 @@ function Browser:showReader(key, comicId, epId, title, chapterTitle)
         schedulePrefetch()
     end
 
+    --- 另存本页：把这一页的**原始字节**写到 <dataDir>/ezvenera/saved/<书名>/<章节>_pNNN.ext。
+    -- 存的是图床给的原图，不是截屏：ImageViewer 自己有 onSaveImageView（两指
+    -- 点 / 左下角点，imageviewer.lua:819）走 Screenshoter，那条路存下来的是
+    -- 带缩放和留边的屏幕画面，且落在截图目录里混在一堆无关截图之间。
+    -- 字节来源三条：内存缓存 → 离线章节的本地文件 → 都没有就只排进下载队列
+    -- （手势回调里同步取图最坏 6s，正踩安卓 5s 输入超时，见 IMG_OPTS）。
+    saveCurrentPage = function(pn)
+        pn = tonumber(pn)
+        if not pn or images[pn] == nil then
+            self.infoMessage(_("这一页没有可保存的图片"))
+            return
+        end
+        local item = images[pn]
+        local entry = cache[pn]
+        local data, hdrs
+        if entry and entry.data then
+            data, hdrs = entry.data, entry.hdrs
+        elseif type(item) == "table" and item.local_file then
+            data = dl.fs.read(item.local_file)
+        end
+        if not data then
+            enqueueNow(pn)
+            self:progressMessage(_("这一页还没取到图，已排进下载队列，稍后再存一次"))
+            return
+        end
+        local src = type(item) == "table" and (item.local_file or item.url) or item
+        local dir = self:savedBasedir() .. "/" .. self:_safeName(title)
+        local path = dir .. "/" .. self:_safeName(chapterTitle or title, 60)
+            .. "_p" .. string.format("%03d", pn) .. "." .. Downloader.extOf(src, hdrs)
+        local err
+        local okw, why = pcall(function()
+            if not dl.fs.mkdir(dir) then return _("目录创建失败") end
+            if not dl.fs.write(path, data) then return _("写入失败") end
+            return nil
+        end)
+        -- 两种失败形状都要变成一句人话：回调自己报的原因（ok=true, 返回串），
+        -- 或回调内部抛出的错误（ok=false）。注意别用 `okw and why or ...`，
+        -- 成功时 why 是 nil，那种写法会把 "nil" 当成错误。
+        if not okw then
+            err = tostring(why)
+        else
+            err = why
+        end
+        if err then
+            logger.warn("ezvenera: save page", path, "failed:", err)
+            self.infoMessage(_("保存失败：") .. err .. "\n" .. path)
+            return
+        end
+        self:progressMessage(
+            (_("已保存第 %d 页（%s）\n%s")):format(pn, fmtSize(#data), path))
+    end
+
     page_table.free = function()
         -- ImageViewer 以列表级 image_disposable=true 触发（onCloseWidget）。
         -- 只丢引用：BB 的数据缓冲由 blitbuffer 的 ffi.gc 终值器回收，
@@ -1977,7 +2234,7 @@ function Browser:showReader(key, comicId, epId, title, chapterTitle)
         -- 仍持有该 BB 的引用。
         closed = true
         -- 导航条是叠在阅读器之上的独立窗口：阅读器没了它必须跟着没，否则
-        -- 三条按钮会留在上一层界面之上、点了没反应。
+        -- 底部那条带会留在上一层界面之上、点了没反应。
         closeNavBar()
         cache = {}
         cache_order = {}
@@ -1986,18 +2243,19 @@ function Browser:showReader(key, comicId, epId, title, chapterTitle)
         bb_bytes = 0
         placeholder_bb = nil
         for i = #prefetch_queue, 1, -1 do prefetch_queue[i] = nil end
-        diagSample("close")
     end
 
     local function servePage(pn)
-        diag(pn)
         if images[pn] == nil then return placeholderPage() end
+        if page_bar then page_bar.paint(pn) end
         wantAhead(pn)
         -- 【ANR】只有打开章节后的第一次绘制走延迟：那一次回调里已经花掉
         -- loadEp（源方法）的时间，再在里面下载+解码一张最坏要 4s 的图就会
         -- 踩到安卓的 5s 输入超时。之后翻页仍可同步取（暖隧道 0.3s）。
-        local defer = first_paint
+        -- 进度条跳页同样要延迟（defer_fetch）：拖到没缓存的远处时绝不能同步取。
+        local defer = first_paint or defer_fetch
         first_paint = false
+        defer_fetch = false
         if defer and not cache[pn] then
             enqueueNow(pn)
             return placeholderPage()
@@ -2079,13 +2337,19 @@ function Browser:showReader(key, comicId, epId, title, chapterTitle)
         logger.warn("ezvenera: reader open failed:", tostring(showerr))
         self.infoMessage(_("无法打开章节：") .. tostring(showerr))
     else
+        -- 长按另存本页（见 _hookLongPressSave 注释）；盖不上不影响阅读。
+        local okhook, hooked = pcall(function()
+            return self:_hookLongPressSave(viewer, saveShownPage)
+        end)
+        if not okhook or not hooked then
+            logger.warn("ezvenera: long-press save unavailable:", tostring(hooked))
+        end
         -- 先让阅读器把首页画出来，再叠导航条（顺序反了会先画一条悬空白条）
         local oknav, naverr = pcall(showNavBar)
         if not oknav then
             nav_bar = nil
             logger.warn("ezvenera: nav bar open failed:", tostring(naverr))
         end
-        diagTick()
     end
 end
 

@@ -62,6 +62,9 @@ local function extOf(url, hdrs)
     return "img"
 end
 
+-- 阅读器「另存本页」也按同一套后缀规则（browser.lua showReader）。
+Downloader.extOf = extOf
+
 -- ---------- 真实文件系统后端（KOReader 侧） ----------
 
 --- deps.fs 未注入时用它。lfs 只做目录操作（进程内禁 os.execute），
