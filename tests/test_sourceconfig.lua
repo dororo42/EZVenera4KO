@@ -399,7 +399,9 @@ end
 function tests.removing_a_source_deletes_files_and_invalidates()
     local b = fakeBrowser(select(2, memStore()), PICACG_INFO)
     local removed, invalidated = 0, 0
-    b.sources = { remove = function() removed = removed + 1 return true end }
+    b.sources = { remove = function() removed = removed + 1 return true end,
+        -- 源菜单会查覆盖备份（没有就不显示「回退到旧版」行）
+        listBackups = function() return {} end }
     b.invalidateSource = function() invalidated = invalidated + 1 end
     b:showSourceMenu("picacg", "Picacg", "1.0.5")
     captured_menu.onMenuSelect({},

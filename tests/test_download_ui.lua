@@ -300,6 +300,35 @@ function tests.detail_chapters_sorted_numerically()
     return true
 end
 
+-- 移植源的章节 id 常是不透明 URL（A漫 v2.0.0：尾部随机串），按 id 排就是
+-- 按随机串字典序排 → 真机目录乱序（21,14,4,7,12,…）。标题里的话数才是顺序。
+function tests.detail_chapters_with_url_ids_sort_by_title_number()
+    local b = makeBrowser()
+    b._awaitSource = function(_, _k, path)
+        if path == "comic.loadInfo" then
+            return { title = "恋爱版本更新中", chapters = {
+                ["https://aman8.org/c/zZq.html"] = "第3話-要來我房間喝一杯嗎?",
+                ["https://aman8.org/c/aBc.html"] = "第21話-在你這裡留下「愛的印記」",
+                ["https://aman8.org/c/xYw.html"] = "第4話-不合時宜的正裝打扮",
+                ["https://aman8.org/c/epA.html"] = "番外-作者的話",
+            } }
+        end
+        return nil
+    end
+    fake.shown = {}
+    b:showDetail("aman", { id = "c1", title = "恋爱版本更新中" })
+    local titles = {}
+    for _, it in ipairs(shownMenus()[1].args.item_table) do
+        if it.epId then titles[#titles + 1] = it.text end
+    end
+    assert_eq("四行章节", 4, #titles)
+    assert_eq("按标题话数排", "第3話-要來我房間喝一杯嗎?", titles[1])
+    assert_eq("4 在 3 之后", "第4話-不合時宜的正裝打扮", titles[2])
+    assert_eq("21 不在 2 前面", "第21話-在你這裡留下「愛的印記」", titles[3])
+    assert_eq("没号的排最后", "番外-作者的話", titles[4])
+    return true
+end
+
 -- 下载完成后回到清单：该行就地变成 ◆ + 体积
 function tests.picker_row_updates_after_download()
     local b, dl = makeBrowser()

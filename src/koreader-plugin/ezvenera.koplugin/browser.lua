@@ -288,6 +288,35 @@ function Browser:_hasMember(key, path)
     return v == true
 end
 
+--- 右对齐列（mandatory）的宽度是硬约束：KOReader 的 menu.lua:202 用
+--- `available_width = content_width - state_width - padding - mandatory_w`
+--- 算标题可用宽度。移植源的章节 id 常是 40+ 字符的绝对 URL（aman.js:208
+--- `cid = this.abs(href)`），mandatory_w 超过 content_width → 宽度变负 →
+--- textboxwidget.lua:879 `makeLine: width must be strictly positive`，真机
+--- 表现为点进详情/目录/下载清单弹「操作失败」（2026-09-26 回归实测）。
+--- 所以在菜单入口统一裁短：按码点计数（切坏 UTF-8 会显示乱码），保留尾部
+--- ——id 的信息量在末尾（`…459293_12.html` 还能认，头部 URL 前缀全是重复）。
+local MANDATORY_MAX_CP = 16
+
+local function shortMandatory(v)
+    if v == nil then return nil end
+    local s = tostring(v)
+    local starts, n = {}, 0
+    local i = 1
+    while i <= #s do
+        n = n + 1
+        starts[n] = i
+        local b = s:byte(i)
+        i = i + (b < 0x80 and 1 or b < 0xE0 and 2 or b < 0xF0 and 3 or 4)
+    end
+    if n <= MANDATORY_MAX_CP then return s end
+    return "…" .. s:sub(starts[n - MANDATORY_MAX_CP + 1])
+end
+
+-- main.lua 的三个 Menu:new 不走 _navMenu，源 key（由文件名清洗而来，可能很长）
+-- 那一列用同一个裁剪规则，见 showInstalledBrowser。
+Browser.shortMandatory = shortMandatory
+
 --- 统一导航菜单构造（审查报告 §10 O1/O2，2026-09-24）。
 --- O1：标题栏左键 = 返回箭头。KOReader 仅在设置 title_bar_left_icon 时才渲染
 ---     左键（menu.lua:737），回调留给调用方（menu.lua:1568）——这里统一为
@@ -299,6 +328,9 @@ end
 ---     menu.lua:743，无法单独劫持），故 × = 逐层返回；在根层（源列表）关闭
 ---     即退出插件。级联退出不再单独实现——语义等价且更可预期。
 function Browser:_navMenu(o)
+    for _, it in ipairs(o.item_table or {}) do
+        it.mandatory = shortMandatory(it.mandatory)
+    end
     return Menu:new{
         title = o.title,
         subtitle = o.subtitle,
@@ -340,9 +372,10 @@ function Browser:showSourceList()
         return
     end
     local item_table = {}
-    for _, e in ipairs(inst) do
+    local labels = self.sources.uniqueLabels(inst)
+    for i, e in ipairs(inst) do
         table.insert(item_table, {
-            text = e.name or e.key,
+            text = labels[i],
             mandatory = e.version,
             key = e.key,
         })
@@ -788,7 +821,8 @@ end
 --- ELF 段偏移算错导致的误判（tombstone 的 pc 要 +0x1a000 才是 vaddr）。重算后
 --- 三次崩溃的 #00 同为 libluajit vaddr 0x87258 的 `STR x12,[x10,#16]`，x10 =
 --- 0x0000dc0800000402（非指针形状）→ 是 VM 内部拿到被写坏的指针，与 traceback
---- 无关。根因排查进行中（任务 #16 / selftest.lua），这里的错误收口本身仍然保留。
+--- 无关。根因已结（quickjs 插件目录候选引起的 SIGSEGV，见 2026-09-25 修复），
+--- 这里的错误收口本身仍然保留。
 local function guardCall(label, fn)
     local ok, err = xpcall(fn, function(msg) return tostring(msg) end)
     if not ok then
@@ -890,11 +924,29 @@ end
 
 -- ---------- 层级 5：详情（章节列表） ----------
 
---- 章节 id 排序：数字 id 按数值（"10" 排在 "9" 之后），其余按字符串。
-local function chapterCmp(a, b)
-    local na, nb = tonumber(a), tonumber(b)
-    if na and nb then return na < nb end
-    return tostring(a) < tostring(b)
+--- 章节排序键：优先标题里的数字（"第21話-…" → 21），其次数字 id。
+--- 为什么不能只按 id：移植源的章节 id 常是站点给的不透明 URL（A漫 v2.0.0 的
+--- 地址尾部是随机串 `…yLT1dpUV.html`），按 id 排 = 按随机串字典序排 → 真机
+--- 目录顺序完全打乱（2026-09-26 回归实测：21,14,4,7,12,…）。
+local function chapterOrder(title, id)
+    local t = tostring(title or "")
+    return tonumber(t:match("第%s*(%d+)")) or tonumber(t:match("^%s*(%d+)"))
+        or tonumber(t:match("(%d+)")) or tonumber(tostring(id))
+end
+
+--- 行比较：有号的按号；同号按 id；没号的排在后面按标题字符串。
+--- 分组章节的 title 带 "卷名 / " 前缀（前缀里的数字会串扰排序），所以有
+--- sortTitle 时按原始章节名取号。
+local function rowCmp(a, b)
+    local na = chapterOrder(a.sortTitle or a.title, a.epId)
+    local nb = chapterOrder(b.sortTitle or b.title, b.epId)
+    if na and nb then
+        if na ~= nb then return na < nb end
+        return tostring(a.epId) < tostring(b.epId)
+    end
+    if na then return true end
+    if nb then return false end
+    return tostring(a.title) < tostring(b.title)
 end
 
 --- 章节表 → 有序数组 { {epId=, title=}, ... }。扁平 {id:title} 与分组
@@ -905,15 +957,14 @@ local function flattenChapters(chapters)
     local rows, groups = {}, {}
     for k, v in pairs(chapters or {}) do
         if type(v) == "table" then
-            local ids = {}
-            for id in pairs(v) do ids[#ids + 1] = id end
-            table.sort(ids, chapterCmp)
             local g = { label = tostring(k), rows = {} }
-            for _, id in ipairs(ids) do
+            for id, name in pairs(v) do
                 g.rows[#g.rows + 1] = {
-                    epId = id, title = tostring(k) .. " / " .. tostring(v[id]),
+                    epId = id, sortTitle = tostring(name),
+                    title = tostring(k) .. " / " .. tostring(name),
                 }
             end
+            table.sort(g.rows, rowCmp)
             groups[#groups + 1] = g
         else
             rows[#rows + 1] = { epId = k, title = tostring(v) }
@@ -925,7 +976,7 @@ local function flattenChapters(chapters)
             for _, r in ipairs(g.rows) do rows[#rows + 1] = r end
         end
     else
-        table.sort(rows, function(a, b) return chapterCmp(a.epId, b.epId) end)
+        table.sort(rows, rowCmp)
     end
     return rows
 end
@@ -1604,7 +1655,7 @@ function Browser:showReader(key, comicId, epId, title, chapterTitle)
                 }
             end
         end
-        table.sort(out, function(a, b) return chapterCmp(a.epId, b.epId) end)
+        table.sort(out, rowCmp)
         if #out > 0 then
             -- 兜底表也存进缓存：源不通时每次按导航都会重跑一次阻塞调用
             -- （真机一按白屏几秒），而离线子集本来就是当下能拿到的全部。
@@ -2598,7 +2649,50 @@ function Browser:showSourceMultiDelete()
     redraw()
 end
 
---- 单个已安装源的操作菜单（参数配置 / 登录 / 清除数据 / 删除）。
+--- 覆盖护栏留下的备份（sources 每次覆盖前把旧文件存成 <key>.js.bak-<版本>）
+--- → 列出可选的回退目标。真机教训：整包导入把用户自己装的 v1.0.2 换成包里的
+--- v1.0.0，当时没有任何退路，只能重下。
+function Browser:_showRestoreBackups(key, backups)
+    local rows = {}
+    -- gettext 先取好：循环变量 `_` 会把文件顶层的 gettext 遮蔽成数字
+    local head, note = _("回退到 v"), _("覆盖前的备份")
+    for _, bak in ipairs(backups) do
+        rows[#rows + 1] = {
+            text = head .. tostring(bak.version),
+            mandatory = note,
+            backup = bak,
+        }
+    end
+    local browser = self
+    local menu = self:_navMenu{
+        title = self:_crumbTitle(key, _("回退版本")),
+        item_table = rows,
+        onMenuSelect = function(menu_self, item)
+            local version = item.backup.version
+            UIManager:close(menu_self)
+            UIManager:show(require("ui/widget/confirmbox"):new{
+                text = _("回退到 v") .. tostring(version) .. "？\n"
+                    .. _("当前版本会先备份，回退后还能再切回来。"),
+                ok_text = _("回退"),
+                ok_callback = function()
+                    browser:_guard(_("回退版本"), function()
+                        local ok, res = browser.sources:restoreBackup(key, version)
+                        if not ok then
+                            browser.infoMessage(_("回退失败：") .. tostring(res))
+                            return
+                        end
+                        browser:invalidateSource(key)
+                        browser.infoMessage(_("已回退到 v") .. tostring(version)
+                            .. _("\n\n下次打开该源即用回退后的版本。"))
+                    end)
+                end,
+            })
+        end,
+    }
+    UIManager:show(menu)
+end
+
+--- 单个已安装源的操作菜单（参数配置 / 登录 / 清除数据 / 回退 / 删除）。
 --- 全部用普通菜单项 callback，不用 hold（ADR-005）。
 function Browser:showSourceMenu(key, name, version)
     local jsKey, lerr = self:_ensureSourceLoaded(key)
@@ -2641,6 +2735,13 @@ function Browser:showSourceMenu(key, name, version)
     if jsKey then
         table.insert(rows, { text = _("清除本地数据（含登录态）"),
             clear_row = true })
+    end
+    -- 版本护栏留下的退路：覆盖过就有 .bak，没有这一行时说明从没覆盖过
+    local backups = self.sources and self.sources:listBackups(key) or {}
+    if #backups > 0 then
+        table.insert(rows, { text = _("回退到旧版…"),
+            mandatory = tostring(#backups) .. _(" 个备份"),
+            restore_row = true })
     end
     table.insert(rows, { text = _("删除源…"), remove_row = true })
     local menu
@@ -2690,6 +2791,9 @@ function Browser:showSourceMenu(key, name, version)
                             end)
                         end,
                     })
+                elseif item.restore_row then
+                    UIManager:close(menu_self)
+                    self:_showRestoreBackups(key, backups)
                 elseif item.remove_row then
                     UIManager:close(menu_self)
                     self:_confirmRemoveSource(key)

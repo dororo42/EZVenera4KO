@@ -8,7 +8,7 @@
 
 | 时刻 | 事件 | 结果 |
 |---|---|---|
-| 09:53 | 构建机 NDK r27c 交叉编译 arm64 引擎 | ✅ libquickjs.so (857KB) + libezvbridge.so |
+| 09:53 | 构建机主机 NDK r27c 交叉编译 arm64 引擎 | ✅ libquickjs.so (857KB) + libezvbridge.so |
 | 10:00 | adb push 全套 Lua + 引擎到 /sdcard/koreader/plugins/ | ✅ 文件就位 |
 | 10:15 | 首次引擎探测 | ❌ SELinux avc denied（sdcardfs execute） |
 | 10:27 | 根因确认：内核 audit `avc: denied { execute } ... sdcardfs` | 定性为平台硬约束 |
@@ -51,7 +51,7 @@
 | remoteinput 测试平板扫码端到端 | 按决策移除（代码保留，门控隐藏） |
 | 代理连通性实测 | 等代理地址 |
 
-## 6. 构建复现（构建机）
+## 6. 构建复现（构建机主机）
 
 ```bash
 # arm64 引擎

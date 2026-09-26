@@ -97,8 +97,9 @@ function Sources.new(deps)
     o.convert = deps.convert          -- 需含 sha256hex(bytes)（convert 提供）
     o.json = deps.json                -- 可注入（测试）；运行时回退内建
     o.datadir = deps.datadir or "ezvenera"
-    -- 已安装清单内存缓存（load 时读盘）
+    -- 已安装清单内存缓存（load 时读盘，指纹变了才重读）
     o._installed = nil
+    o._installed_stamp = nil
     return o
 end
 
@@ -154,19 +155,46 @@ function Sources:installedFile()
     return self.datadir .. "/installed.json"
 end
 
+--- 清单指纹：有 lfs 时用 mtime+size，没有时只剩字节数。
+--- 只用来判断"盘上这份是不是我内存里这份"，不参与业务语义。
+function Sources:_manifestStamp()
+    local path = self:installedFile()
+    local lfs = openLfs()
+    local mtime = (lfs and lfs.attributes) and lfs.attributes(path, "modification") or nil
+    local size
+    local f = io.open(path, "rb")
+    if f then size = f:seek("end"); f:close() end
+    if mtime == nil and size == nil then return nil end
+    return tostring(mtime) .. ":" .. tostring(size)
+end
+
+--- 内存缓存要在盘上清单被别人改动后失效：整包导入/adb 直接推 installed.json
+--- 是这里最常见的操作，旧版本只在进程启动时读一次，推完不重启就永远看不到新源
+--- （2026-09-25 真机"13 个源只显示 4 个"即此，见 reports §10.9）。
 function Sources:installed()
-    if self._installed then return self._installed end
+    local stamp = self:_manifestStamp()
+    if self._installed and (stamp == nil or stamp == self._installed_stamp) then
+        return self._installed
+    end
     local f = io.open(self:installedFile(), "r")
-    if not f then self._installed = {} return self._installed end
+    if not f then
+        self._installed = {}
+        self._installed_stamp = stamp
+        return self._installed
+    end
     local s = f:read("*a")
     f:close()
     local v = jdecode(self, s)
     self._installed = (type(v) == "table") and v or {}
+    self._installed_stamp = stamp
     return self._installed
 end
 
-function Sources:saveInstalled()
-    local s = jencode(self, self:installed())
+--- 写盘。inst = 调用方正在改的那份清单表：外部改动可能让 installed() 中途换表，
+--- 传进来才能保证"我改的就是我写出去的、也是缓存里的那一份"。
+function Sources:saveInstalled(inst)
+    inst = inst or self:installed()
+    local s = jencode(self, inst)
     if not s then return false end
     ensureDir(self.datadir)
     local path = self:installedFile()
@@ -175,12 +203,18 @@ function Sources:saveInstalled()
     if not f then return false end
     f:write(s)
     f:close()
-    if os.rename(tmp, path) then return true end
+    if os.rename(tmp, path) then
+        self._installed = inst
+        self._installed_stamp = self:_manifestStamp()
+        return true
+    end
     local f2 = io.open(path, "w")
     if not f2 then return false end
     f2:write(s)
     f2:close()
     pcall(function() os.remove(tmp) end)
+    self._installed = inst
+    self._installed_stamp = self:_manifestStamp()
     return true
 end
 
@@ -280,13 +314,163 @@ function Sources:mergeLocal(remoteList)
     return merged, seenLocal
 end
 
+-- ---------- 版本护栏（同名 key 不同版本导入时的裁决） ----------
+
+--- 点分数字版本解析：'1.0.2' / 'v1.0.2' / '1.0.2-beta' → {1,0,2}；
+--- 'local' / 'custom' / nil → nil（不可比较）。
+local function versionParts(v)
+    if type(v) ~= "string" then return nil end
+    local s = v:match("^%s*(.-)%s*$"):gsub("^[vV]", ""):gsub("[%-+].*$", "")
+    if s == "" or not s:match("^%d") or not s:match("^[%d%.]+$") then
+        return nil
+    end
+    local out = {}
+    for tok in s:gmatch("[^%.]+") do
+        local n = tonumber(tok)
+        if not n then return nil end
+        table.insert(out, n)
+    end
+    return out
+end
+
+--- 返回 -1 / 0 / 1，任一侧不可解析返回 nil。
+local function compareVersions(a, b)
+    local pa, pb = versionParts(a), versionParts(b)
+    if not pa or not pb then return nil end
+    for i = 1, math.max(#pa, #pb) do
+        local x, y = pa[i] or 0, pb[i] or 0
+        if x ~= y then return x > y and 1 or -1 end
+    end
+    return 0
+end
+
+--- 内容指纹：优先真 sha256（加密后端在位时），其次测试桩注入的 sha256hex，
+--- 后端缺失才退回长度指纹（清单里长得像 'len:15063'，一眼可辨不是哈希）。
+local function fingerprint(convert, body)
+    if convert then
+        -- 测试桩按普通函数注入（sha256hex/sha256），真 Convert 按方法注入 digest
+        if convert.sha256hex then return convert.sha256hex(body) end
+        if convert.digest and convert.hexEncode then
+            local raw = convert:digest("sha256", body)
+            if raw then return convert.hexEncode(raw) end
+        end
+        if convert.sha256 then return convert.sha256(body) end
+    end
+    return ("len:%d"):format(#body)
+end
+
+--- 备份文件名：`<源文件>.bak-<旧版本>`。同一旧版本重复导入只留一份（覆盖它），
+--- 不会每次安装都堆一个新文件。
+local function backupPath(file, version)
+    return tostring(file) .. ".bak-" .. tostring(version or "0")
+        :gsub("[^%w%.%-]", "_")
+end
+
+--- 覆盖前把旧文件留一份，返回备份路径（无旧文件/写不动则 nil）。
+--- 备份失败绝不阻断安装：装不上比少一份退路更糟。
+function Sources:_backupPrevious(key)
+    local e = self:installed()[key]
+    if type(e) ~= "table" or not e.file then return nil end
+    local src = io.open(e.file, "r")
+    if not src then return nil end
+    local body = src:read("*a")
+    src:close()
+    if body == "" then return nil end
+    local dest = backupPath(e.file, e.version)
+    local g = io.open(dest, "w")
+    if not g then return nil end
+    g:write(body)
+    g:close()
+    return dest
+end
+
+--- 该源可用的备份（按版本号字符串降序，最新在前）。没有列目录能力时返回空表。
+function Sources:listBackups(key)
+    local e = self:installed()[key]
+    if not e or not e.file then return {} end
+    local lfs = openLfs()
+    if not lfs then return {} end
+    local dir, stem = e.file:match("^(.-)/([^/]+)%.js$")
+    if not dir then return {} end
+    local prefix = stem .. ".js.bak-"
+    local out = {}
+    for name in lfs.dir(dir) do
+        if type(name) == "string" and name:sub(1, #prefix) == prefix then
+            table.insert(out, {
+                version = name:sub(#prefix + 1),
+                file = dir .. "/" .. name,
+            })
+        end
+    end
+    table.sort(out, function(a, b) return a.version > b.version end)
+    return out
+end
+
+--- 回退到某个备份：当前版本先备份掉，再把备份内容写回正式文件并改清单。
+--- 返回 (ok, err|entry)
+function Sources:restoreBackup(key, version)
+    local inst = self:installed()
+    local e = inst[key]
+    if type(e) ~= "table" then return false, "未安装该源: " .. tostring(key) end
+    local found
+    for _, b in ipairs(self:listBackups(key)) do
+        if b.version == tostring(version) then found = b.file end
+    end
+    if not found then return false, "找不到备份 v" .. tostring(version) end
+    local src = io.open(found, "r")
+    if not src then return false, "备份读不动: " .. found end
+    local body = src:read("*a")
+    src:close()
+    if body == "" then return false, "备份为空文件" end
+    self:_backupPrevious(key)
+    local from_version = e.version
+    local g = io.open(e.file, "w")
+    if not g then return false, "无法写入 " .. tostring(e.file) end
+    g:write(body)
+    g:close()
+    e.version = tostring(version)
+    e.sha256 = fingerprint(self.convert, body)
+    e.size = #body
+    e.installed_at = os.time()
+    e.verdict = "restore"
+    e.prev_version = from_version
+    e.backup = backupPath(e.file, from_version)
+    self:saveInstalled(inst)
+    return true, e
+end
+
+--- 覆盖护栏（只裁决，不碰磁盘；备份留到内容到手、马上要落盘时再做，
+--- 免得一次失败的网络安装留下没用的 .bak）。返回 (allowed, verdict, reason)：
+---   new/upgrade/same/unknown → 放行（unknown = 版本串不可解析，如 'custom'）
+---   downgrade → 默认拦下，只有调用方显式 allow_downgrade（用户在确认框里
+---   选了「仍然覆盖」）才放行
+function Sources:_checkOverwrite(key, next_version, allow_downgrade)
+    local prev = self:installed()[key]
+    if type(prev) ~= "table" then return true, "new" end
+    local c = compareVersions(prev.version, next_version)
+    local verdict = c == nil and "unknown" or (c < 0 and "upgrade"
+        or (c == 0 and "same" or "downgrade"))
+    if verdict == "downgrade" and not allow_downgrade then
+        return false, verdict,
+            ("低版本不覆盖：本机已装 v%s，来的是 v%s"):format(
+                tostring(prev.version), tostring(next_version))
+    end
+    return true, verdict, prev.version
+end
+
 -- ---------- 安装 / 更新 / 删除 ----------
 
---- 下载并安装/更新一个源。返回 (ok, err|installedEntry)
-function Sources:install(entry, baseUrl)
+--- 下载并安装/更新一个源。返回 (ok, err|installedEntry[, verdict])；
+--- 被版本护栏拦下时第三个返回值是 "downgrade"，UI 靠它给出「仍然覆盖」。
+--- opts = { allow_downgrade = bool }：降级需要调用方（用户确认框）显式放行。
+function Sources:install(entry, baseUrl, opts)
     if type(entry) ~= "table" or not entry.key or not entry.fileName then
         return false, "invalid entry (need key + fileName)"
     end
+    local allowed, verdict, note = self:_checkOverwrite(entry.key, entry.version,
+        opts and opts.allow_downgrade)
+    if not allowed then return false, note, verdict end
+
     local bases = {}
     if baseUrl and baseUrl ~= "" then
         table.insert(bases, baseUrl)
@@ -315,17 +499,9 @@ function Sources:install(entry, baseUrl)
     end
     if not body then return false, lastErr or "download failed" end
 
-    -- sha256（convert.sha256hex 或退化为长度指纹——CI 桩可注入）
-    local sha
-    if self.convert and self.convert.sha256hex then
-        sha = self.convert.sha256hex(body)
-    elseif self.convert and self.convert.sha256 then
-        sha = self.convert.sha256(body)
-    else
-        sha = ("len:%d"):format(#body)
-    end
-
     local path = self:sourcePath(entry.key)
+    -- 落盘前留一份旧文件：覆盖之后还能退回（见 restoreBackup / listBackups）
+    local backup = self:_backupPrevious(entry.key)
     local f = io.open(path, "w")
     if not f then return false, "cannot write " .. path end
     f:write(body)
@@ -340,12 +516,15 @@ function Sources:install(entry, baseUrl)
         version = entry.version,
         source = usedBase or baseUrl or self.DEFAULT_BASE_URL,
         file = path,
-        sha256 = sha,
+        sha256 = fingerprint(self.convert, body),
         size = #body,
         installed_at = os.time(),
+        verdict = verdict,
+        prev_version = note,
+        backup = backup,
     }
-    self:saveInstalled()
-    return true, inst[entry.key]
+    self:saveInstalled(inst)
+    return true, inst[entry.key], verdict
 end
 
 --- 删除已安装源。返回 (ok, err)
@@ -366,7 +545,7 @@ function Sources:remove(key)
         end
     end
     inst[key] = nil
-    if not self:saveInstalled() then
+    if not self:saveInstalled(inst) then
         -- 内存清单和磁盘必须同步：写盘失败就把条目放回去（磁盘上本来就在）
         inst[key] = e
         return false, "清单写入失败：installed.json"
@@ -387,6 +566,24 @@ function Sources:readSource(key)
     return s
 end
 
+--- 列表显示名：同名不同 key 在 Venera 生态里是常态（三家都做过「鸟鸟韩漫」），
+--- 只给名字用户根本分不清点进去的是哪个源 → 重名的补 [key]，唯一的原样。
+--- 入参 = {{key=, name=}, …}，返回等长数组。纯函数，不碰清单。
+function Sources.uniqueLabels(list)
+    local count = {}
+    for _, e in ipairs(list) do
+        local nm = e.name or e.key
+        count[nm] = (count[nm] or 0) + 1
+    end
+    local out = {}
+    for _, e in ipairs(list) do
+        local nm = e.name or e.key
+        out[#out + 1] = nm .. (count[nm] > 1
+            and (" [" .. tostring(e.key) .. "]") or "")
+    end
+    return out
+end
+
 --- 已安装 key 列表（稳定排序）
 function Sources:listInstalled()
     local out = {}
@@ -398,23 +595,22 @@ function Sources:listInstalled()
 end
 
 --- 本地 .js 直装（design §3.7：选择本地文件安装）
---- 返回 (ok, err|installedEntry)。key 缺省取文件名去扩展。
+--- 返回 (ok, err|installedEntry[, verdict])。key 缺省取文件名去扩展。
 --- meta（可选）= {name=…, version=…}：整包导入时索引里带着显示名和版本，
 --- 传进来才不会把清单写成 key/"local"（UI 列表与更新比较都依赖这两项）。
-function Sources:installLocalFile(path, key, meta)
+--- opts = { allow_downgrade = bool }：同 install()。
+function Sources:installLocalFile(path, key, meta, opts)
     local f = io.open(path, "r")
     if not f then return false, "cannot open " .. tostring(path) end
     local body = f:read("*a")
     f:close()
     if body == "" then return false, "empty file" end
     key = key or (path:match("([^/\\]+)%.js$")) or ("local_" .. os.time())
-    local sha
-    if self.convert and self.convert.sha256hex then
-        sha = self.convert.sha256hex(body)
-    else
-        sha = ("len:%d"):format(#body)
-    end
+    local allowed, verdict, note = self:_checkOverwrite(key,
+        meta and meta.version, opts and opts.allow_downgrade)
+    if not allowed then return false, note, verdict end
     local dest = self:sourcePath(key)
+    local backup = self:_backupPrevious(key)
     local g = io.open(dest, "w")
     if not g then return false, "cannot write " .. dest end
     g:write(body)
@@ -426,22 +622,27 @@ function Sources:installLocalFile(path, key, meta)
         version = (meta and meta.version) or "local",
         source = "local:" .. path,
         file = dest,
-        sha256 = sha,
+        sha256 = fingerprint(self.convert, body),
         size = #body,
         installed_at = os.time(),
+        verdict = verdict,
+        prev_version = note,
+        backup = backup,
     }
-    self:saveInstalled()
-    return true, inst[key]
+    self:saveInstalled(inst)
+    return true, inst[key], verdict
 end
 
 --- 本地整包导入：`<dir>/manifest.json`（与官方 index.json 同 schema）
---- + 同目录里的 .js。返回 (results, err)，results = {n_ok, n_fail, list=}，
---- list 每项 {key, name, ok, err}。
+--- + 同目录里的 .js。返回 (results, err)，results = {n_ok, n_fail, n_skip, list=}，
+--- list 每项 {key, name, ok, err, verdict[, skipped]}。
+--- opts = { allow_downgrade = bool }：包内版本低于本机已装时，默认这条只报
+--- 跳过不写盘；用户在确认框里选「仍然覆盖」后才传 true 重跑一遍。
 --- 为什么不顺手写进 index/：自定义索引（addCustomIndex）走的是「记下基址、
 --- 之后按 fileName 联网下载」；离线整包没有可下载的基址，落进 index/ 反而让
 --- 「浏览索引并安装」拿默认基址去下一个 404。所以只落 sources/ +
 --- installed.json，装完直接在「已安装源」里可见可用。
-function Sources:installLocalBundle(dir)
+function Sources:installLocalBundle(dir, opts)
     if type(dir) ~= "string" or dir == "" then
         return nil, "需要本地目录路径"
     end
@@ -462,7 +663,7 @@ function Sources:installLocalBundle(dir)
     if type(list) ~= "table" or #list == 0 then
         return nil, "索引解析失败或为空（需要 JSON 数组）"
     end
-    local out = { list = {}, n_ok = 0, n_fail = 0, n_over = 0 }
+    local out = { list = {}, n_ok = 0, n_fail = 0, n_over = 0, n_skip = 0 }
     for _, e in ipairs(list) do
         local res = {}
         if type(e) ~= "table" or not e.key or not e.fileName then
@@ -470,24 +671,31 @@ function Sources:installLocalBundle(dir)
             res.ok, res.err = false, "条目缺 key/fileName"
         else
             res.key, res.name = e.key, e.name or e.key
-            -- 同名 key 已在装机上：整包会**静默覆盖**用户自己装的版本
-            -- （真机教训：包里带了个 zaimanhua，把用户 v1.0.2 换成了 v1.0.0）。
-            -- 覆盖本身是想要的行为（整包就是批量装），但必须报出来。
+            -- 同名 key 已在装机上：整包是批量装，升级/同版本直接覆盖，但必须
+            -- 报出来（真机教训：包里带了个 zaimanhua，把用户 v1.0.2 换成了
+            -- v1.0.0 且无人知晓）。降级默认拦下，除非调用方传 allow_downgrade。
             local prev = self:installed()[e.key]
             if type(prev) == "table" then
                 res.overwrite = true
                 res.prev_version = prev.version
             end
-            local ok, r = self:installLocalFile(dir .. "/" .. e.fileName,
-                e.key, { name = e.name, version = e.version })
-            if ok and res.overwrite then out.n_over = out.n_over + 1 end
+            local ok, r, verdict = self:installLocalFile(
+                dir .. "/" .. e.fileName, e.key,
+                { name = e.name, version = e.version }, opts)
+            res.verdict = verdict
             res.ok = ok and true or false
+            if ok and res.overwrite then out.n_over = out.n_over + 1 end
             if ok then
                 res.version = r.version
                 out.n_ok = out.n_ok + 1
             else
                 res.err = tostring(r)
-                out.n_fail = out.n_fail + 1
+                if verdict == "downgrade" then
+                    res.skipped = true
+                    out.n_skip = out.n_skip + 1
+                else
+                    out.n_fail = out.n_fail + 1
+                end
             end
         end
         table.insert(out.list, res)
@@ -507,8 +715,8 @@ end
 
 --- 从任意 http(s) 地址直装一个源 js（「添加自定义漫画源」最快的一条路）。
 --- 地址拆成 基址 + 文件名 后复用 install() 的下载/落盘/清单链路。
---- 返回 (ok, err|installedEntry)
-function Sources:installFromURL(url, name)
+--- 返回 (ok, err|installedEntry[, verdict])
+function Sources:installFromURL(url, name, opts)
     if type(url) ~= "string" or not url:match("^https?://") then
         return false, "地址需要以 http:// 或 https:// 开头"
     end
@@ -520,7 +728,7 @@ function Sources:installFromURL(url, name)
     if key == "" then return false, "文件名不合法，生不出本地标识" end
     local nm = (type(name) == "string" and name ~= "") and name or key
     return self:install({ key = key, fileName = fileName, name = nm,
-        version = "custom" }, base)
+        version = "custom" }, base, opts)
 end
 
 --- 添加自定义源索引（一份 index.json）：原文落进本地索引目录，之后

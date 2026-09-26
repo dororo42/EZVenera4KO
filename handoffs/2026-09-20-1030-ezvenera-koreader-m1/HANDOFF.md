@@ -3,7 +3,7 @@
 > 交接日期：2026-09-20
 > 来源 agent：ZCode（本会话）
 > 目标 agent：未指定（已生成三档全套：S/R/P）
-> 项目根：`EZVenera_KO/`（`C:\Users\Administrator\Downloads\EZVenera_KO`）
+> 项目根：`EZVenera_KO/`（`<项目根>`）
 
 ## 当前状态摘要
 

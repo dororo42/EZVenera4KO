@@ -33,9 +33,10 @@ dist/
 # ===== 工具链下载物 =====
 tools/downloads/
 
-# ===== Python venv（M12：父目录排除 + 反向保留配置标记）=====
-tools/.venv/*
-!tools/.venv/pyvenv.cfg
+# ===== Python venv / 字节码缓存（本机环境，含绝对路径，不入库）=====
+tools/.venv/
+__pycache__/
+*.pyc
 
 # ===== H4：quickjs vendor 源码不入库 =====
 rust/ezvjs-bridge/vendor/

@@ -74,7 +74,6 @@ function EzVenera:init()
     -- 真机当前未装 SimpleUI：注册失败必须静默，不能让 init() 抛错。
     self:_registerSimpleUIQA()
     self:_startSettingsAutoflush()
-    self:_selftestOnStartup()
 end
 
 --- 定期把 KOReader 的全局设置落盘。
@@ -104,106 +103,6 @@ function EzVenera:_startSettingsAutoflush()
     end
     pcall(UIManager.scheduleIn, UIManager, 120, tick)
     self._settings_autoflush = true
-end
-
---- 【临时排查件（任务 #16）】真机菜单要点好几层才能点到自检，触屏导航不可靠，
---- 改成启动时读标志文件自动跑：`adb shell "echo A60 > /sdcard/koreader/ezv_selftest"`
---- 后重启 KOReader 即可。诊断结束连同整个函数与 selftest.lua 一起删除。
-function EzVenera:_selftestOnStartup()
-    local ok, err = pcall(function()
-        local path = "/sdcard/koreader/ezv_selftest"
-        local f = io.open(path, "r")
-        if not f then return end
-        local mode = (f:read("*a") or ""):gsub("%s", "")
-        f:close()
-        os.remove(path)
-        if mode == "" then return end
-        logger.warn("ezveneraST flag", mode, "-> schedule")
-        UIManager:scheduleIn(8, function()
-            -- L3（审查报告 §4）：诊断体同样必须守卫（R9 失败模式）
-            guardCallback("自检(" .. tostring(mode) .. ")", function()
-            local ST = require("selftest")
-            local head = mode:sub(1, 1)
-            if head == "A" then
-                ST.parseStress(tonumber(mode:sub(2)) or 60)
-            elseif head == "C" then
-                ST.imageStress(self:getBrowser(), "baozi",
-                    "yinghuo-yinghuo", "0_17", tonumber(mode:sub(2)))
-            elseif head == "D" then
-                ST.pageStress(self:getBrowser(), "baozi",
-                    "yinghuo-yinghuo", "0_17", "萤火", "0_17", tonumber(mode:sub(2)))
-            elseif head == "E" then
-                local okE, eng = self:initEngine()
-                if not okE then
-                    logger.warn("ezveneraST E 引擎不可用:", tostring(eng))
-                else
-                    ST.abiProbe(eng, tonumber(mode:sub(2)))
-                end
-            elseif head == "F" then
-                ST.downloadFlow(self:getBrowser(), "baozi",
-                    "yinghuo-yinghuo", "0_17", "萤火", "0_17")
-            elseif head == "G" then
-                ST.glyphProbe()
-            elseif head == "H" then
-                local b = self:getBrowser()
-                local last = (b.library and b.library:listHistory() or {})[1]
-                if not (last and last.epId) then
-                    logger.warn("ezveneraST H 无历史记录可计时")
-                else
-                    ST.openTiming(b, last.key, last.comicId, last.epId,
-                        tonumber(mode:sub(2)))
-                end
-            elseif head == "U" then
-                ST.customSourceFlow(self:getSources(),
-                    "https://raw.githubusercontent.com/WEP-56/EZvenera-config/main/index.json",
-                    "https://raw.githubusercontent.com/WEP-56/EZvenera-config/main/baozi.js")
-            elseif head == "V" then
-                -- `V` = 默认目录；`V|/sdcard/koreader/xxx` = 指到别的目录
-                ST.bundleLoad(self:getSources(), self:getBrowser(),
-                    mode:match("^V|(.+)$") or "/sdcard/koreader/ezv_bundle")
-            elseif head == "W" then
-                -- `W|https://a,https://b` = 对这些 URL 做直连/经代理 A/B 探测；
-                -- 光一个 `W` 用缺省清单（2026-09-24 真机 wantread 的两家 + 一家对照）
-                local urls = {}
-                for u in (mode:match("^W%|(.+)$") or ""):gmatch("[^,]+") do
-                    table.insert(urls, u)
-                end
-                if #urls == 0 then
-                    urls = { "https://www.acgomh.com/",
-                        "https://www.8comic.com/member/search.aspx?key=a&page=1",
-                        "https://cn.czmanga.com/list/new" }
-                end
-                ST.urlProbe(self:getBrowser(), urls)
-            elseif head == "P" then
-                ST.directProbe(self:getBrowser(), "baozi",
-                    "tazhimigong-erpingmian", "0")
-            elseif head == "O" then
-                local b = self:getBrowser()
-                -- 目标：`O|源key|漫画id|章节id`；`Ob` = ANR 复现那一章（baozi
-                -- 的图床经代理不通）；其余走阅读历史第一条。
-                local target
-                if mode:sub(2, 2) == "|" then
-                    local k, c, e = mode:match("^O|([^|]+)|([^|]+)|(.+)$")
-                    target = { key = k, comicId = c, epId = e }
-                elseif mode == "Ob" then
-                    target = { key = "baozi", comicId = "tazhimigong-erpingmian",
-                        epId = "0", title = "纸蜂蜜-二维", epTitle = "ep0" }
-                else
-                    target = (b.library and b.library:listHistory() or {})[1]
-                end
-                if not (target and target.epId) then
-                    logger.warn("ezveneraST O 无历史记录可开")
-                else
-                    ST.openChapter(b, target)
-                end
-            else
-                ST.readerPath(self:getBrowser(), "baozi",
-                    "yinghuo-yinghuo", "0_17", "萤火", "0_17")
-            end
-            end)  -- guardCallback
-        end)
-    end)
-    if not ok then logger.warn("ezveneraST startup hook failed:", err) end
 end
 
 function EzVenera:infoMessage(text)
@@ -604,35 +503,6 @@ function EzVenera:addToMainMenu(menu_items)
                 end,
                 keep_menu_open = true,
             },
-            -- 【临时排查件（任务 #16）】A/B 压力自测：判"章节阅读期同一 PC 崩
-            -- 在 libluajit"是否需要 quickjs/FFI 回调参与。诊断完整块删除。
-            {
-                text = "自检(排查用)",
-                sub_item_table = {
-                    {
-                        text = "A 纯 Lua 解析压力",
-                        callback = function()
-                            guardCallback("自检A", function()
-                                local ST = require("selftest")
-                                plugin:infoMessage(tostring(ST.parseStress(60)))
-                            end)
-                        end,
-                        keep_menu_open = true,
-                    },
-                    {
-                        text = "B 完整阅读路径",
-                        callback = function()
-                            guardCallback("自检B", function()
-                                local ST = require("selftest")
-                                ST.readerPath(plugin:getBrowser(), "baozi",
-                                    "yinghuo-yinghuo", "0_17", "萤火", "0_17")
-                            end)
-                        end,
-                        keep_menu_open = false,
-                    },
-                },
-                keep_menu_open = true,
-            },
                 }
             end)
             if not okitems then
@@ -715,7 +585,9 @@ function EzVenera:runNetworkTask(label, fn)
 end
 
 --- 三条添加路径共用的收尾：让 browser 丢掉旧缓存，并把结果说清楚。
-function EzVenera:reportSourceInstalled(ok, entry)
+--- verdict = sources 给的覆盖裁决（new/upgrade/same/unknown/downgrade）；
+--- entry.prev_version 非空说明这次是覆盖，把「旧版还在，能退回」一并讲清。
+function EzVenera:reportSourceInstalled(ok, entry, verdict)
     if not ok then
         self:infoMessage("添加失败：" .. tostring(entry))
         return
@@ -725,8 +597,40 @@ function EzVenera:reportSourceInstalled(ok, entry)
     end
     self:infoMessage("已添加源：" .. tostring(entry.name or entry.key)
         .. "\n标识: " .. tostring(entry.key)
+        .. (verdict and verdict ~= "new"
+            and ("\n覆盖: v" .. tostring(entry.prev_version) .. " → v"
+                .. tostring(entry.version)) or "")
         .. "\n大小: " .. tostring(entry.size or "?") .. " 字节"
+        .. (entry.backup and "\n旧版已备份（该源菜单里可回退）" or "")
         .. "\n\n现在可以从「浏览漫画源」打开它。")
+end
+
+--- 装一次源并按结果收尾。被版本护栏拦下（本机已装更高版本）时不是报错收场，
+--- 而是给一次「仍然覆盖」的机会：确认后以 allow_downgrade=true 重跑同一个 run。
+--- run(force) → sources 安装函数的薄封装，force 即 allow_downgrade。
+function EzVenera:installSourceThen(run)
+    local ok, res, verdict = run(false)
+    if ok or verdict ~= "downgrade" then
+        self:reportSourceInstalled(ok, res, verdict)
+        return
+    end
+    local ConfirmBox = require("ui/widget/confirmbox")
+    local plugin = self
+    UIManager:show(ConfirmBox:new{
+        text = tostring(res) .. "\n\n仍然覆盖会丢掉当前版本（覆盖前自动备份，"
+            .. "之后可在「已安装源 → 该源 → 回退到上一版」找回）。",
+        ok_text = "仍然覆盖",
+        cancel_text = "保留现有",
+        ok_callback = function()
+            -- 重跑同样不能压在确认框的输入派发上（安卓 5s 无响应门槛，任务 #22）
+            UIManager:scheduleIn(0.2, function()
+                guardCallback("覆盖安装", function()
+                    local o2, r2, v2 = run(true)
+                    plugin:reportSourceInstalled(o2, r2, v2)
+                end)
+            end)
+        end,
+    })
 end
 
 --- 从任意 URL 直装一个源 js（EZVenera/Venera 社区分享的单文件源）。
@@ -739,8 +643,11 @@ function EzVenera:addSourceFromURL()
                 return
             end
             plugin:runNetworkTask("从 URL 添加源", function()
-                plugin:reportSourceInstalled(
-                    plugin:getSources():installFromURL(url))
+                local src = plugin:getSources()
+                plugin:installSourceThen(function(force)
+                    return src:installFromURL(url, nil,
+                        { allow_downgrade = force })
+                end)
             end)
         end)
 end
@@ -750,8 +657,11 @@ function EzVenera:addSourceFromLocal()
     local plugin = self
     plugin:askText("本地源文件路径", "/sdcard/koreader/ezvenera/mysrc.js",
         "/sdcard/koreader/", function(path)
-            plugin:reportSourceInstalled(
-                plugin:getSources():installLocalFile(path))
+            local src = plugin:getSources()
+            plugin:installSourceThen(function(force)
+                return src:installLocalFile(path, nil, nil,
+                    { allow_downgrade = force })
+            end)
         end)
 end
 
@@ -759,33 +669,66 @@ end
 --- 和对应的 .js。移植流水线产出、别人打包分享的一族源用它最快——
 --- 「从本地文件添加源」一次只装一个，这里一次装完并逐条报失败原因。
 --- 纯本地 IO（几十个小文件拷贝），不进 runNetworkTask 也不至于卡主循环。
+--- 版本护栏：包里低于已装版本的条目默认只跳过并单列报出，问一次「仍然覆盖」
+--- 才重跑（真机教训：包里一个 zaimanhua 把用户 v1.0.2 换成了 v1.0.0）。
 function EzVenera:importLocalBundle()
     local plugin = self
     plugin:askText("本地源包目录（含 manifest.json）",
         "/sdcard/koreader/ezv_bundle/", "/sdcard/koreader/", function(dir)
+            local function report(res, forced)
+                local fails, skips = {}, {}
+                for _, r in ipairs(res.list) do
+                    if not r.ok then
+                        table.insert(r.skipped and skips or fails,
+                            tostring(r.key) .. "：" .. tostring(r.err))
+                    end
+                end
+                -- 弹框放不下一条条列，两类各截前 8 条
+                local function clip(list)
+                    if #list <= 8 then return list, "" end
+                    local keep = {}
+                    for i = 1, 8 do keep[i] = list[i] end
+                    return keep, "\n…（另有 " .. tostring(#list - 8) .. " 条略）"
+                end
+                local failTxt, moreF = clip(fails)
+                local skipTxt, moreS = clip(skips)
+                plugin:infoMessage(
+                    ("导入完成：成功 %d，失败 %d，跳过 %d（共 %d 条）%s%s%s"):format(
+                        res.n_ok, res.n_fail, res.n_skip or 0, #res.list,
+                        (res.n_over or 0) > 0 and ("\n覆盖了 " .. res.n_over
+                            .. " 个同名已装源（旧版已备份，可回退）") or "",
+                        #skipTxt > 0 and ("\n\n版本低于已装，未覆盖：\n"
+                            .. table.concat(skipTxt, "\n") .. moreS) or "",
+                        #failTxt > 0 and ("\n\n失败：\n"
+                            .. table.concat(failTxt, "\n") .. moreF) or ""))
+                if (res.n_skip or 0) > 0 and not forced then
+                    local ConfirmBox = require("ui/widget/confirmbox")
+                    UIManager:show(ConfirmBox:new{
+                        text = "包里有 " .. tostring(res.n_skip)
+                            .. " 个源的版本低于本机已装版本，刚才已跳过。\n"
+                            .. "要把它们也换成包里的低版本吗？"
+                            .. "\n\n（覆盖前自动备份，之后可在该源菜单里回退。）",
+                        ok_text = "仍然覆盖",
+                        cancel_text = "保留现有",
+                        ok_callback = function()
+                            UIManager:scheduleIn(0.2, function()
+                                guardCallback("整包导入（含降级）", function()
+                                    local r2 = plugin:getSources()
+                                        :installLocalBundle(dir,
+                                            { allow_downgrade = true })
+                                    if r2 then report(r2, true) end
+                                end)
+                            end)
+                        end,
+                    })
+                end
+            end
             local res, err = plugin:getSources():installLocalBundle(dir)
             if not res then
                 plugin:infoMessage("导入失败：" .. tostring(err))
                 return
             end
-            local fails = {}
-            for _, r in ipairs(res.list) do
-                if not r.ok then
-                    table.insert(fails, tostring(r.key) .. "：" .. tostring(r.err))
-                end
-            end
-            local more = ""
-            if #fails > 8 then
-                more = "\n…（另有 " .. tostring(#fails - 8) .. " 条略）"
-                local cut = {}
-                for i = 1, 8 do cut[i] = fails[i] end
-                fails = cut
-            end
-            plugin:infoMessage(("导入完成：成功 %d，失败 %d（共 %d）%s%s"):format(
-                res.n_ok, res.n_fail, #res.list,
-                (res.n_over or 0) > 0 and ("\n覆盖了 " .. res.n_over
-                    .. " 个同名的已装源") or "",
-                #fails > 0 and ("\n\n" .. table.concat(fails, "\n") .. more) or ""))
+            report(res)
         end)
 end
 
@@ -870,11 +813,11 @@ function EzVenera:showIndexBrowser()
     local ConfirmBox = require("ui/widget/confirmbox")
     local UIManager = require("ui/uimanager")
     local inst = sources:installed()
+    local labels = sources.uniqueLabels(merged)
     local item_table = {}
-    for _, e in ipairs(merged) do
-        local mark = inst[e.key] and "◆ " or ""
+    for i, e in ipairs(merged) do
         table.insert(item_table, {
-            text = mark .. (e.name or e.key),
+            text = (inst[e.key] and "◆ " or "") .. labels[i],
             mandatory = e.version and ("v" .. tostring(e.version)) or nil,
             entry = e,
         })
@@ -888,17 +831,22 @@ function EzVenera:showIndexBrowser()
         title_bar_fm_style = true,
         onMenuSelect = function(menu_self, item)
             local e = item.entry
+            local prev = inst[e.key]
             UIManager:show(ConfirmBox:new{
                 text = "安装/更新源？\n" .. (e.name or e.key)
                     .. (e.version and ("  v" .. tostring(e.version)) or "")
                     .. (e._base and ("\n基址: " .. tostring(e._base)) or "")
-                    .. (inst[e.key] and "\n（已安装，将覆盖更新）" or ""),
+                    .. (prev and ("\n已装 v" .. tostring(prev.version)
+                        .. "，将被覆盖（覆盖前自动备份）") or ""),
                 ok_text = "安装",
                 ok_callback = function()
                     -- 下载在 scheduleIn 节拍里跑：ConfirmBox 的 ok_callback 仍在
                     -- 输入派发路径上，直接联网就是安卓「无响应」（任务 #22）。
                     self:runNetworkTask("安装源", function()
-                        self:reportSourceInstalled(sources:install(e))
+                        self:installSourceThen(function(force)
+                            return sources:install(e, nil,
+                                { allow_downgrade = force })
+                        end)
                     end)
                 end,
             })
@@ -919,10 +867,11 @@ function EzVenera:showInstalledBrowser()
     local Menu = require("ui/widget/menu")
     local UIManager = require("ui/uimanager")
     local item_table = {}
-    for _, e in ipairs(inst) do
+    local labels = sources.uniqueLabels(inst)
+    for i, e in ipairs(inst) do
         table.insert(item_table, {
-            text = (e.name or e.key) .. "  v" .. tostring(e.version),
-            mandatory = e.key,
+            text = labels[i] .. "  v" .. tostring(e.version),
+            mandatory = require("browser").shortMandatory(e.key),
             key = e.key,
             name = e.name or e.key,
             version = e.version,

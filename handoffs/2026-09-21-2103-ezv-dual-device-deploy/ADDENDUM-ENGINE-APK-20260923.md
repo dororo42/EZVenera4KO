@@ -56,7 +56,7 @@
    该目录在 LD_LIBRARY_PATH 内，`ffi.load("libquickjs")` 按名直接命中）。
 2. 构建机编引擎对（§5），python3 zipfile 重打 APK：剥 `META-INF/*.{SF,RSA}` +
    `MANIFEST.MF`，注入 `lib/arm64-v8a/{libquickjs.so,libezvbridge.so}`。
-3. `apt install apksigner zipalign`（sudo 密码见用户）→ `zipalign -f 4` →
+3. `apt install apksigner zipalign`（sudo 口令走本地环境）→ `zipalign -f 4` →
    `keytool` 生成 ezv.keystore → `apksigner sign`（v1+v2）。
 4. `adb uninstall`（签名变更必须卸载重装；/sdcard/koreader 数据全保留）→
    `adb install`。

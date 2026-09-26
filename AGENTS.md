@@ -26,6 +26,9 @@
 
 - **位置**：`handoffs/2026-09-23-0905-ezvenera-android-engine-apk/`（HANDOFF.md + RESUME_PROMPT.md，整合版；前驱链在 `handoffs/2026-09-21-2103-ezv-dual-device-deploy/` 的 6 份 ADDENDUM）
 - **状态**：安卓引擎随 APK 分发落地（T-S3）：零 patchelf 构建 + APK 注入重签安装，dlopen/init/eval 全链稳定，用户真机实测零崩溃（2026-09-23）。双历史根因已修（patchelf verneed 损坏、pump 回调竞态→no-op）。promise 型源数据（分类/搜索）待 S2 主循环泵。
-- **2026-09-24 之后已落地（真机验证，尚未 git 提交）**：搜索闭环可用、章节列表/前后章切换、整章下载 + 下载与缓存管理、收藏夹 + 阅读历史、已装源参数配置、自定义漫画源四条路径（URL 直装 / 自定义 index.json / 本地文件 / 索引浏览）、安卓 ANR 消除（联网一律走 `scheduleIn` 节拍）、SimpleUI 对接（顶层 `callback` + 3 个 QA 描述符）、KOReader 设置自动落盘（修「键盘布局每次重开都要重设」）。闸门：270 单测 / 语法 17 / no-hold / vendored 全绿。
-- **发布状态（2026-09-24 已完成）**：公开仓 **https://github.com/dororo42/EZVenera4KO**（GPL-3.0，`private=False`，默认分支 `main`）。发布走**仓库外的脱敏暂存树**（`ezv_scratch/make_pub_stage.py`：只重写 `*.md`，其余字节原样复制并断言 sha256 相等），历史与本地工作树都不外泄；引擎以 Release 资产 `ezvenera-engine-android-arm64.zip` 分发，不重分发 KOReader APK。CI 全绿（270 单测 / 语法 17 / no-hold / vendored）。**本地仓仍按要求保持未提交**，公开内容来自暂存树的独立 2 提交历史。
-- **下一步**：吊销/轮换聊天里贴过的 PAT（用户侧）；真机回归一轮（安装 README 路线 A）；清理 `selftest.lua` 与启动标志文件诊断件（任务 #17）；本地工作树择机分批提交；Kindle 4 冻结（恢复时按零 patchelf 配方重编）
+- **2026-09-24 之后已落地（真机验证，2026-09-26 已分批提交）**：搜索闭环可用、章节列表/前后章切换、整章下载 + 下载与缓存管理、收藏夹 + 阅读历史、已装源参数配置、自定义漫画源四条路径（URL 直装 / 自定义 index.json / 本地文件 / 索引浏览）、导入版本护栏 + `sha256` 真值 + 重名可分辨 + 回退到旧版、安卓 ANR 消除（联网一律走 `scheduleIn` 节拍）、SimpleUI 对接（顶层 `callback` + 3 个 QA 描述符）、KOReader 设置自动落盘（修「键盘布局每次重开都要重设」）。
+- **v2.0.0 重制包真机回归（2026-09-26）**：13 源全链路通过（源列表/主页/分类/详情/章节/阅读/前后章/下载/缓存/离线/收藏/历史/搜索/引擎状态）。修掉两个真缺陷：① URL 型 `mandatory` 过宽触发 `makeLine (width must be strictly positive)` 崩溃 → `browser.lua` 的 `shortMandatory()` 统一裁剪；② URL 型 epId 章节乱序 → 按标题话号排序。闸门：339 单测 / 语法 16 / no-hold / vendored 全绿。
+- **提交前脱敏（2026-09-26，脚本在仓库外 `ezv_scratch/sanitize_repo_md.py`）**：`*.md` 里的本机绝对路径、局域网主机号/端口、ssh 别名、keystore 与 sudo 口令提法全部换成占位说法（残留断言为 0）；`tools/.venv/`、`scripts/__pycache__/` 取消跟踪。**旧口令字面量仍存在于本仓 git 历史**，签名 keystore 需按需重建/轮换（用户侧）。
+- **发布状态（2026-09-24 已完成）**：公开仓 **https://github.com/dororo42/EZVenera4KO**（GPL-3.0，`private=False`，默认分支 `main`）。发布走**仓库外的脱敏暂存树**（`ezv_scratch/make_pub_stage.py`：只重写 `*.md`，其余字节原样复制并断言 sha256 相等），历史与本地工作树都不外泄；引擎以 Release 资产 `ezvenera-engine-android-arm64.zip` 分发，不重分发 KOReader APK。
+- **下一步**：重发一次暂存树（公开仓仍含 2026-09-25 已删的诊断件）；吊销/轮换聊天里贴过的 PAT（用户侧）；`categoryComics.optionLoader` 动态筛选**暂不补**（用户决策 2026-09-26）；Kindle 4 冻结（恢复时按零 patchelf 配方重编）
+- **诊断件已清除（2026-09-25）**：`selftest.lua`、启动标志文件 `/sdcard/koreader/ezv_selftest` 的读取钩子、菜单「自检(排查用)」全部删除

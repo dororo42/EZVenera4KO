@@ -6,7 +6,7 @@
 - Source agent: Coder Manager (OpenClaw, agent:coder-manager)
 - Target agent: unknown（三档全配）
 - Target mode: all
-- Project: C:\Users\Administrator\Downloads\EZVenera_KO
+- Project: <项目根>
 - Branch: main
 - HEAD: 766fc60（工作区有大量未提交修改 + untracked，见下）
 - OS: win32（NUC-I5）
@@ -20,7 +20,7 @@
 
 ## 当前状态摘要
 
-双机部署实测进行中。**Kindle4 (<KINDLE-HOST>:2222, root（口令走本地环境）)**：ezvenera.koplugin + remoteinput.koplugin 已推送并加载成功（菜单出现、弹窗可用），但 JS 引擎初始化失败——根因已定位：quickjs-ng v0.17.0 不导出 `JS_ToCString`/`JS_NewCFunction`（头文件里是 static inline，实际导出 `JS_ToCStringLen2`/`JS_NewCFunction3`），jshost.lua 的 cdef 用旧符号名导致 missingSymbols 自检失败后按设计降级。**修复方案已定（方案 A：改 jshost.lua cdef 与调用），尚未写代码**。另 K4 产物 .so 在裸 luajit 下有 `pthread_once`/`clock_gettime` 符号问题（K4 glibc 2.12 老；KOReader 进程内无此问题），所以引擎验证必须经 KOReader 内部路径。**安卓测试平板 (<OLD-HOST>, adb)**：remoteinput 已推送并加载（HTTP inspector 确认 `/koreader/ui/remoteinput` 存在），但用户点菜单「扫码远程输入」后 KOReader 崩溃——崩溃栈未捕获（崩溃发生在 logcat 环形缓冲之外，无 crash.log 可拉，run-as 不可用），设备已挂常驻 logcat 落盘（`/sdcard/koreader/.dbg_live.log`），**等用户再点一次即可抓栈**。**编译机 构建机 (<BUILD-HOST>, ssh build-host-tunnel 免密)**：cmake 4.2.3/patchelf/NDK r27c(~/android-ndk)/crosstool-ng 已就绪；kindle5 工具链 ct-ng build 卡在源码下载（ftpmirror ~10KB/s，make-4.3 已完成，卡 linux-2.6.32.71 内核头），需换镜像预置 tarball。
+双机部署实测进行中。**Kindle4 (<K4>:2222, root（口令走本地环境）)**：ezvenera.koplugin + remoteinput.koplugin 已推送并加载成功（菜单出现、弹窗可用），但 JS 引擎初始化失败——根因已定位：quickjs-ng v0.17.0 不导出 `JS_ToCString`/`JS_NewCFunction`（头文件里是 static inline，实际导出 `JS_ToCStringLen2`/`JS_NewCFunction3`），jshost.lua 的 cdef 用旧符号名导致 missingSymbols 自检失败后按设计降级。**修复方案已定（方案 A：改 jshost.lua cdef 与调用），尚未写代码**。另 K4 产物 .so 在裸 luajit 下有 `pthread_once`/`clock_gettime` 符号问题（K4 glibc 2.12 老；KOReader 进程内无此问题），所以引擎验证必须经 KOReader 内部路径。**安卓测试平板 (<平板>, adb)**：remoteinput 已推送并加载（HTTP inspector 确认 `/koreader/ui/remoteinput` 存在），但用户点菜单「扫码远程输入」后 KOReader 崩溃——崩溃栈未捕获（崩溃发生在 logcat 环形缓冲之外，无 crash.log 可拉，run-as 不可用），设备已挂常驻 logcat 落盘（`/sdcard/koreader/.dbg_live.log`），**等用户再点一次即可抓栈**。**编译机 构建机 (<构建机>, ssh <构建机 ssh 别名> 免密)**：cmake 4.2.3/patchelf/NDK r27c(~/android-ndk)/crosstool-ng 已就绪；kindle5 工具链 ct-ng build 卡在源码下载（ftpmirror ~10KB/s，make-4.3 已完成，卡 linux-2.6.32.71 内核头），需换镜像预置 tarball。
 
 ## 最近提交（上下文参考）
 
@@ -46,7 +46,7 @@
 
 ### 架构概览
 
-Windows 主控 ──ssh:2222──> Kindle4（插件目录 /mnt/us/koreader/plugins/）；──adb──> 安卓测试平板（/sdcard/koreader/plugins/，HTTP 调试 http://<OLD-HOST>:8080/koreader/）；──ssh build-host-tunnel──> Ubuntu 构建机（交叉编译机）。产物链路：构建机编译 → scp 推 K4 / adb push 推测试平板。
+Windows 主控 ──ssh:2222──> Kindle4（插件目录 /mnt/us/koreader/plugins/）；──adb──> 安卓测试平板（/sdcard/koreader/plugins/，HTTP 调试 http://<平板>:8080/koreader/）；──ssh <构建机 ssh 别名>──> Ubuntu 构建机（交叉编译机）。产物链路：构建机编译 → scp 推 K4 / adb push 推测试平板。
 
 ### 关键文件
 
@@ -67,7 +67,7 @@ Windows 主控 ──ssh:2222──> Kindle4（插件目录 /mnt/us/koreader/plu
 - [x] K4 引擎失败根因定位（v0.17 符号变更，证据链完整）
 - [x] 测试平板 remoteinput 推送 + inspector 确认加载
 - [x] 测试平板 HTTP 调试通道打通（读树/事件/截图；不能执行任意 Lua）
-- [x] 构建机搭建（cmake/patchelf/NDK/crosstool-ng）
+- [x] 构建机环境搭建（cmake/patchelf/NDK/crosstool-ng）
 - [x] 测试平板常驻 logcat 落盘（/sdcard/koreader/.dbg_live.log）
 - [ ] K4 引擎修复（方案 A）——未动代码
 - [ ] 平板扫码崩溃栈捕获——等用户点击
@@ -110,10 +110,10 @@ Windows 主控 ──ssh:2222──> Kindle4（插件目录 /mnt/us/koreader/plu
 ### 重要上下文
 
 - **K4 BusyBox grep 不支持 -E**（-F 可用），长命令拆分或用多级 grep -F 管道。
-- **K4 SSH 必须 pty 交互**：`ssh -tt -p 2222 <USER>@<KINDLE-HOST> "cmd"`，process 工具 open pty 后 write "\n" 补免密回车。BatchMode 必失败。
+- **K4 SSH 必须 pty 交互**：`ssh -tt -p 2222 <USER>@<K4> "cmd"`，process 工具 open pty 后 write "\n" 补免密回车。BatchMode 必失败。
 - **K4 上跑 Lua 用 `cd /mnt/us/koreader && ./luajit /tmp/xxx.lua`**，不要加 LD_LIBRARY_PATH（撞 pthread 符号）。
 - **测试平板 adb input tap 坐标盲点极多**（状态栏吞事件、层级深、误触翻译），UI 复现不可靠；一律 logcat 落盘 + 用户手点。
-- **M2 inspector**（http://<OLD-HOST>:8080/koreader/）只能浏览树/改属性/发 dispatcher 事件/截图，不能执行任意 Lua。事件注入实测可用。
+- **M2 inspector**（http://<平板>:8080/koreader/）只能浏览树/改属性/发 dispatcher 事件/截图，不能执行任意 Lua。事件注入实测可用。
 - **另一团队会话仍活跃在同一工作区**（其产出 mtime 7:08-8:03），改动前先 git status。
 - **vendored init.js sha256 已锁**（b6a0d302…），引擎符号修复不要动 init.js。
 - **PowerShell 远程命令含 Lua `..` 拼接会被本地解析器破坏引号**——复杂 Lua 先写文件再 scp。
@@ -136,10 +136,10 @@ Windows 主控 ──ssh:2222──> Kindle4（插件目录 /mnt/us/koreader/plu
 
 ### 构建 / 运行 / 测试命令
 
-- 主仓检查：`cd C:\Users\Administrator\Downloads\EZVenera_KO && tools\.venv\Scripts\python.exe scripts\check_syntax.py`（+run_tests/check_no_hold/verify_vendored，当前全绿）
-- K4 推送：`scp -P 2222 -r <local> <USER>@<KINDLE-HOST>:/mnt/us/koreader/plugins/`
+- 主仓检查：`cd <项目根> && tools\.venv\Scripts\python.exe scripts\check_syntax.py`（+run_tests/check_no_hold/verify_vendored，当前全绿）
+- K4 推送：`scp -P 2222 -r <local> <USER>@<K4>:/mnt/us/koreader/plugins/`
 - M2 推送+重启：`adb push <local> /sdcard/koreader/plugins/`；`adb shell "am force-stop org.koreader.launcher.fdroid"`；`adb shell "monkey -p org.koreader.launcher.fdroid -c android.intent.category.LAUNCHER 1"`
-- 构建机：`ssh -o BatchMode=yes build-host-tunnel "<cmd>"`；监控 `tail /tmp/ct_build.log`；产物 `~/x-tools/arm-kindle5-linux-gnueabi/bin/`；NDK clang `~/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang`
+- 构建机：`ssh -o BatchMode=yes <构建机 ssh 别名> "<cmd>"`；监控 `tail /tmp/ct_build.log`；产物 `~/x-tools/arm-kindle5-linux-gnueabi/bin/`；NDK clang `~/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang`
 
 ### 环境变量（只写名字）
 

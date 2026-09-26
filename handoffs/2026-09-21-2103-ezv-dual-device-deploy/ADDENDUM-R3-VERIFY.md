@@ -55,7 +55,7 @@ R3 的 §0 基线（125/125、16/16、clean、SHA256 match）与本会话复跑�
 | kindle5 工具链 | ✅ gcc 14.4.0 @ 构建机:~/x-tools/arm-kindle5-linux-gnueabi/ |
 | K4 引擎产物重编 | ✅ libquickjs.so + libezvbridge.so（构建机编出，SHA256 186351…/454303…） |
 | K4 推送 | ✅ .so + 修复版 jshost.lua 均已上机（昨夜确认） |
-| K4 修复版 bridge/main/settings 推送 | ⏸ **阻塞**：K4 SSH 自 09:15 起 banner exchange 超时（ping 通但 sshd 无响应；构建机同样 No route to host——K4 WiFi 处于省电/半休眠） |
+| K4 修复版 bridge/main/settings 推送 | ⏸ **阻塞**：K4 SSH 自 09:15 起 banner exchange 超时（ping 通但 sshd 无响应；构建机侧同样 No route to host——K4 WiFi 处于省电/半休眠） |
 | M2 remoteinput 崩溃修复 | ✅ 修复+推送+重启验证完成；扫码端到端按用户决策延后 |
 | M2 ezvenera+arm64 引擎 | ⏸ 待推（NDK 已装 构建机，流水线脚本可复用 /tmp/build_k4.sh 改 android target） |
 

@@ -357,6 +357,10 @@ function tests.source_list_to_home_keeps_stack()
     b._guard = function(_, _label, fn) fn() end
     b.sources = { listInstalled = function()
         return { { key = "x", name = "测试源", version = "1.0.0" } }
+    end, uniqueLabels = function(list)
+        local o = {}
+        for i, e in ipairs(list) do o[i] = e.name or e.key end
+        return o
     end }
     b._ensureSourceLoaded = function() return "jsk" end
     b._awaitSource = function(_, _k, path)

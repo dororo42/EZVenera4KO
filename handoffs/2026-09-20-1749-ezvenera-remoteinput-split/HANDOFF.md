@@ -3,7 +3,7 @@
 > 交接日期：2026-09-20（17:49）
 > 来源 agent：WorkBuddy 代码审查专家会话
 > 目标 agent：未指定（后续将有**其他团队审查与接手**，本档按完整对接标准编写）
-> 项目根：`EZVenera_KO/`（`C:\Users\Administrator\Downloads\EZVenera_KO`）
+> 项目根：`EZVenera_KO/`（`<项目根>`）
 > 前序交接：`handoffs/2026-09-20-1030-ezvenera-koreader-m1/HANDOFF.md`（M1 首份，必读）
 
 ## 当前状态摘要
@@ -30,7 +30,7 @@
 
 ### 路线 A：Lighthouse 北京实例（主路线，2026-09-20 已核实可用）
 
-> ✅ 2026-09-20 实测（Lighthouse MCP）：**`lhins-ni6p5t1q`（OpenClaw(龙虾)-MmNJ，ap-beijing，2C/2G/50GB SSD，公网 101.42.35.95）RUNNING**，x86_64 / Ubuntu 24.04.4 / 根分区 27GB 可用 / 内存可用 1.2G——满足编译条件。⚠️ 实例 **2026-09-30 到期（手动续费模式）**，编译窗口 10 天，逾期需续费。
+> ✅ 2026-09-20 实测（Lighthouse MCP）：**`lhins-ni6p5t1q`（OpenClaw(龙虾)-MmNJ，ap-beijing，2C/2G/50GB SSD，公网 <IP>）RUNNING**，x86_64 / Ubuntu 24.04.4 / 根分区 27GB 可用 / 内存可用 1.2G——满足编译条件。⚠️ 实例 **2026-09-30 到期（手动续费模式）**，编译窗口 10 天，逾期需续费。
 > 历史备注（已降级）：上海实例 `lhins-3esurdsa` 已于 2026-09-15 到期隔离、API 全拒，仅作记录，不再作为编译目标。
 
 koxtoolchain 提供 **x86_64 Linux 预编译工具链**（无需在服务器上编 gcc），quickjs 本体编译极快。步骤：

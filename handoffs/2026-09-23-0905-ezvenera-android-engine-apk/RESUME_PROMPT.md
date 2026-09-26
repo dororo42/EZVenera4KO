@@ -26,7 +26,7 @@
 ## 立即下一步
 
 1. **S2 异步泵**（唯一关键项）：eval 后不内联泵，改 `UIManager:scheduleIn` 主循环节拍逐拍泵 job（每拍 ≤10 个、预算 ≤100ms），回调全部收敛主循环 → 恢复分类/搜索/阅读数据流。注意：**JS_ExecutePendingJob 单次探测也会触发竞态崩溃**，pending 检测需走 glue 侧通知。
-2. 真机验证需网络（设备当前无外网；settings 残留代理 <DEV-HOST>:<PROXY-PORT> 未验证）。
+2. 真机验证需网络（设备当前无外网；settings 残留代理 <局域网代理> 未验证）。
 3. git 分批提交（扫码删除 / M2 UI / 崩溃修复 / 引擎 APK 化 / handoff）。
 
 ## 禁止操作
@@ -42,4 +42,4 @@
 - native 崩溃：`adb shell "dumpsys dropbox --print SYSTEM_TOMBSTONE"`（取最后一条 pid 段）
 - 符号化：构建机上 `llvm-symbolizer --obj=~/ezv/EZVenera_KO/build/quickjs-android-old/libqjs.so <vaddr>`
 - 引擎日志：logcat 过滤 `ezvenera`（eval 四段 / `bridge <-` 方法名 / pump 注释）
-- APK 重打全套：`build/apk-engine/`（build_nopatchelf.sh → make_apk3.sh → ezv.keystore/口令走环境变量）
+- APK 重打全套：`build/apk-engine/`（build_nopatchelf.sh → make_apk3.sh → ezv.keystore，口令走环境变量）

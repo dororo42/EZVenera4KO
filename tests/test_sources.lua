@@ -100,7 +100,7 @@ local fakeConvert = {
 -- Windows 兼容临时目录（%TEMP%）
 local TMP = os.getenv("TEMP") or "/tmp"
 local seq = 0
-local function makeSrc(net)
+local function makeSrc(net, convert)
     seq = seq + 1
     local datadir = TMP .. "/ezv_test_" .. tostring(seq) .. "_" ..
         tostring(os.time() % 100000)
@@ -108,7 +108,7 @@ local function makeSrc(net)
     os.execute('mkdir -p "' .. datadir .. '" 2>/dev/null')
     return Sources.new{
         netclient = net,
-        convert = fakeConvert,
+        convert = convert or fakeConvert,
         datadir = datadir,
         json = J,
     }
@@ -465,17 +465,182 @@ function tests.install_local_bundle_counts_overwrites()
     writeFile(s.datadir .. "/manifest.json", BUNDLE_MAN)
     writeFile(s.datadir .. "/a.js", ALPHA_JS)
     writeFile(s.datadir .. "/b.js", BETA_JS)
-    -- 先单装一个 alpha（模拟用户自己装过）
+    -- 先单装一个 alpha 的旧版本（模拟用户自己装过；包里的 1.0.0 更高 → 允许覆盖）
     local ok0 = s:installLocalFile(s.datadir .. "/a.js", "alpha",
-        { name = "Alpha 旧版", version = "9.9.9" })
+        { name = "Alpha 旧版", version = "0.9.0" })
     assert(ok0, "预装 alpha")
     local res, err = s:installLocalBundle(s.datadir)
     assert(res, "整包导入应成功: " .. tostring(err))
     assert_eq("n_ok", 2, res.n_ok)
     assert_eq("n_over", 1, res.n_over)
     assert_eq("条目 1 标记覆盖", true, res.list[1].overwrite)
-    assert_eq("记下被覆盖的旧版本", "9.9.9", res.list[1].prev_version)
+    assert_eq("记下被覆盖的旧版本", "0.9.0", res.list[1].prev_version)
+    assert_eq("裁决为升级", "upgrade", res.list[1].verdict)
     assert_eq("条目 2 未覆盖", nil, res.list[2].overwrite)
+    return true
+end
+
+-- ---------- 版本护栏：降级默认拦下、显式放行才覆盖、覆盖前留备份 ----------
+
+function tests.bundle_downgrade_is_skipped_unless_forced()
+    local s = makeSrc(fakeNet{})
+    writeFile(s.datadir .. "/manifest.json", BUNDLE_MAN)
+    writeFile(s.datadir .. "/a.js", ALPHA_JS)
+    writeFile(s.datadir .. "/b.js", BETA_JS)
+    local new_js = "class AlphaSource extends ComicSource {} -- 用户的新版\n"
+    writeFile(s.datadir .. "/a_new.js", new_js)
+    assert(s:installLocalFile(s.datadir .. "/a_new.js", "alpha",
+        { name = "Alpha 新版", version = "9.9.9" }), "预装 9.9.9")
+    local res = s:installLocalBundle(s.datadir)
+    assert_eq("降级算跳过不算失败", 0, res.n_fail)
+    assert_eq("跳过 1 条", 1, res.n_skip)
+    assert_eq("另一条照常装", 1, res.n_ok)
+    assert_eq("条目 1 裁决", "downgrade", res.list[1].verdict)
+    assert_eq("条目 1 未安装", false, res.list[1].ok)
+    assert(tostring(res.list[1].err):find("低版本") ~= nil,
+        "跳过要给原因: " .. tostring(res.list[1].err))
+    assert_eq("用户的新版文件一个字节没动", new_js, s:readSource("alpha"))
+    -- 用户在确认框里选了「仍然覆盖」→ 重跑同一目录
+    local res2 = s:installLocalBundle(s.datadir, { allow_downgrade = true })
+    assert_eq("放行后两条全装", 2, res2.n_ok)
+    assert_eq("跳过清零", 0, res2.n_skip)
+    assert_eq("清单降到包内版本", "1.0.0", s:installed().alpha.version)
+    return true
+end
+
+function tests.version_compare_is_numeric_not_lexical()
+    local s = makeSrc(fakeNet{})
+    writeFile(s.datadir .. "/v1.js", "class A {} // 1.10\n")
+    writeFile(s.datadir .. "/v2.js", "class A {} // 1.9\n")
+    assert(s:installLocalFile(s.datadir .. "/v1.js", "aa",
+        { name = "AA", version = "1.10" }), "装 1.10")
+    local ok, err, verdict = s:installLocalFile(s.datadir .. "/v2.js", "aa",
+        { name = "AA", version = "1.9" })
+    assert(not ok, "1.9 低于 1.10（按字符串比会反过来）: " .. tostring(err))
+    assert_eq("verdict", "downgrade", verdict)
+    return true
+end
+
+function tests.blocked_install_does_not_touch_network()
+    local log = {}
+    local s = makeSrc(recNet({ ["jm%.js"] = {200, JM_JS} }, log))
+    assert(s:install({ key = "jm", fileName = "jm.js", name = "JM",
+        version = "2.0.0" }), "预装 2.0.0")
+    local ok, err, verdict = s:install({ key = "jm", fileName = "jm.js",
+        name = "JM", version = "1.0.0" })
+    assert(not ok, "降级拦下: " .. tostring(err))
+    assert_eq("verdict", "downgrade", verdict)
+    assert_eq("拦下时不该先下载", 1, #log)
+    return true
+end
+
+function tests.backup_and_restore_roundtrip()
+    local s = makeSrc(fakeNet{})
+    local old_js = "class A {} // v1.0.0\n"
+    local new_js = "class A {} // v1.0.2\n"
+    writeFile(s.datadir .. "/o.js", old_js)
+    writeFile(s.datadir .. "/n.js", new_js)
+    assert(s:installLocalFile(s.datadir .. "/o.js", "alpha",
+        { name = "Alpha", version = "1.0.0" }), "装 1.0.0")
+    local ok, e = s:installLocalFile(s.datadir .. "/n.js", "alpha",
+        { name = "Alpha", version = "1.0.2" })
+    assert(ok, "升级到 1.0.2")
+    assert(type(e.backup) == "string" and e.backup ~= "", "覆盖应留备份")
+    assert(e.prev_version == "1.0.0", "记下来自的旧版本")
+    local bf = io.open(e.backup, "r")
+    assert(bf, "备份文件真的在磁盘上")
+    local bbody = bf:read("*a"); bf:close()
+    assert_eq("备份内容是旧文件", old_js, bbody)
+    -- 列目录要靠 fake lfs（测试进程里没有 libkoreader-lfs）；回退内部也要列
+    -- 目录找备份，所以整段都得让假件在位
+    local bak_name = e.backup:match("([^/]+)$")
+    local cleanup = withFakeLfs({ ".", "..", "alpha.js", bak_name })
+    local list = s:listBackups("alpha")
+    assert_eq("列出 1 个备份", 1, #list)
+    assert_eq("备份版本号", "1.0.0", list[1].version)
+    local okr, re = s:restoreBackup("alpha", "1.0.0")
+    cleanup()
+    assert(okr, "回退应成功: " .. tostring(re))
+    assert_eq("清单版本回到 1.0.0", "1.0.0", s:installed().alpha.version)
+    assert_eq("源文件回到旧内容", old_js, s:readSource("alpha"))
+    assert_eq("回退前的 1.0.2 也被备份", "1.0.2", re.prev_version)
+    return true
+end
+
+function tests.restore_backup_rejects_missing_version()
+    local s = makeSrc(fakeNet{})
+    writeFile(s.datadir .. "/o.js", "class A {} // 1.0.0\n")
+    assert(s:installLocalFile(s.datadir .. "/o.js", "alpha",
+        { name = "Alpha", version = "1.0.0" }), "装 alpha")
+    local ok, err = s:restoreBackup("alpha", "8.8.8")
+    assert(not ok, "没有这个备份不能回退")
+    assert(tostring(err):find("找不到") ~= nil, "要说清原因: " .. tostring(err))
+    return true
+end
+
+--- 清单缓存必须跟着磁盘走：整包导入、adb 直接推 installed.json 都是这里的
+--- 日常操作，旧实现只在进程首次读取后永不再读，推完不重启就永远看不到新源
+--- （2026-09-25 真机「13 个源只显示 4 个」，见 reports §10.9）。
+function tests.installed_reflects_external_manifest_change()
+    local a = makeSrc(fakeNet{})
+    writeFile(a.datadir .. "/x.js", "-- x\n")
+    assert(a:installLocalFile(a.datadir .. "/x.js", "x",
+        { name = "X", version = "1.0.0" }), "a 装第一条")
+    assert_eq("a 看到 1 条", 1, #a:listInstalled())
+    -- 外部改动：另一个进程（整包导入 / adb 直接推清单）重写了 installed.json。
+    -- 桩件里的 encode 是常量，所以这里手写清单正文。
+    writeFile(a.datadir .. "/installed.json",
+        '{"x":{"name":"X","version":"1.0.0"},"y":{"name":"Y","version":"1.0.0"}}')
+    assert_eq("外部新增对 a 立即可见", 2, #a:listInstalled())
+    local seen = {}
+    for _, e in ipairs(a:listInstalled()) do seen[#seen + 1] = e.key end
+    table.sort(seen)
+    assert_eq("两条都要在", "x,y", table.concat(seen, ","))
+    return true
+end
+
+--- 盘上没动时不该反复读盘解码：同一张表复用（指纹一致 → 命中缓存）。
+function tests.installed_cache_reused_when_file_untouched()
+    local s = makeSrc(fakeNet{})
+    writeFile(s.datadir .. "/z.js", "-- z\n")
+    assert(s:installLocalFile(s.datadir .. "/z.js", "z",
+        { name = "Z", version = "1.0.0" }), "装 z")
+    local t1 = s:installed()
+    assert(rawequal(t1, s:installed()), "未变更时复用同一张表")
+    -- 内存里改了但没落盘：指纹没变，改动不能被磁盘上的旧内容顶掉
+    t1.z.name = "改名了"
+    assert_eq("内存改动保留", "改名了", s:installed().z.name)
+    return true
+end
+
+function tests.sha256_prefers_digest_backend()
+    -- 真 Convert 的形状：digest 按方法（收 self）、hexEncode 是普通函数
+    local conv = {
+        digest = function(_, name, data)
+            if name ~= "sha256" then return nil, "unknown" end
+            return data   -- 桩：把原文当"原始摘要"，交给 hexEncode
+        end,
+        hexEncode = function(data)
+            local out = {}
+            for i = 1, #data do out[i] = string.format("%02x", data:byte(i)) end
+            return table.concat(out)
+        end,
+    }
+    local s = makeSrc(fakeNet{}, conv)
+    local path = s.datadir .. "/h.js"
+    writeFile(path, "AB")
+    local ok, e = s:installLocalFile(path, "h", { name = "H", version = "1" })
+    assert(ok, "安装成功: " .. tostring(e))
+    assert_eq("sha256 字段是真哈希十六进制", "4142", e.sha256)
+    -- 后端不给摘要时退回长度指纹（而不是留个假 sha256）
+    local dead = { digest = function() return nil, "unavailable" end,
+        hexEncode = function(d) return d end }
+    local s2 = makeSrc(fakeNet{}, dead)
+    local path2 = s2.datadir .. "/h.js"
+    writeFile(path2, "AB")
+    local ok2, e2 = s2:installLocalFile(path2, "h", { version = "1" })
+    assert(ok2, "无后端也要装: " .. tostring(e2))
+    assert_eq("退回长度指纹并标明", "len:2", e2.sha256)
     return true
 end
 

@@ -64,8 +64,19 @@ end
 
 --- sources 桩：listInstalled 给固定表，remove 记调用并可指定失败 key
 local function fakeSources(list, fail_map)
-    local st = { list = list, removed = {}, fail = fail_map or {} }
+    local st = { list = list, removed = {}, fail = fail_map or {},
+        backups = {}, restored = {} }
     function st:listInstalled() return self.list end
+    function st.uniqueLabels(list)
+        local o = {}
+        for i, e in ipairs(list) do o[i] = e.name or e.key end
+        return o
+    end
+    function st:listBackups() return self.backups end
+    function st:restoreBackup(key, version)
+        table.insert(self.restored, key .. "@" .. tostring(version))
+        return true, { key = key, version = version }
+    end
     function st:remove(key)
         if self.fail[key] then return false, self.fail[key] end
         for i, e in ipairs(self.list) do
@@ -149,6 +160,66 @@ function tests.source_menu_info_row_shows_declaration_error()
     assert_eq("一条提示", 1, #b.messages)
     assert(b.messages[1]:find("bad schema JSON", 1, true),
         "信息行要带上声明读取失败原因: " .. b.messages[1])
+    return true
+end
+
+-- ---- ①b 覆盖护栏的退路：有备份才给「回退到旧版」入口 ----
+
+local function menuWithBackups(backups)
+    fake.shown = {}
+    local st = fakeSources({ { key = "a", name = "甲", version = "1.0.2" } })
+    st.backups = backups
+    local b = makeB({ sources = st, engine = {
+        sourceInfo = function() return { settings = {} } end,
+    } })
+    b:showSourceMenu("a", "甲", "1.0.2")
+    return b, st, lastMenu()
+end
+
+function tests.source_menu_rollback_row_only_with_backups()
+    local _, _, m = menuWithBackups({})
+    assert_eq("没备份 → 没有回退行",
+        "源信息|参数配置…|清除本地数据（含登录态）|删除源…",
+        texts(m.args.item_table))
+    local _, _, m2 = menuWithBackups{
+        { version = "1.0.0", file = "/x/a.js.bak-1.0.0" },
+    }
+    assert_eq("有备份 → 给出入口（仍是普通菜单项，ADR-005）",
+        "源信息|参数配置…|清除本地数据（含登录态）|回退到旧版…|删除源…",
+        texts(m2.args.item_table))
+    return true
+end
+
+function tests.rollback_flow_restores_and_invalidates()
+    local b, st, m = menuWithBackups{
+        { version = "1.0.0", file = "/x/a.js.bak-1.0.0" },
+    }
+    local row
+    for _, r in ipairs(m.args.item_table) do
+        if r.restore_row then row = r end
+    end
+    b.invalidated = {}
+    b.invalidateSource = function(_, key) table.insert(b.invalidated, key) end
+    m.args.onMenuSelect(m, row)                      -- 打开备份列表
+    local list_menu = lastMenu()
+    assert(list_menu, "点回退行应打开备份列表")
+    local pick
+    for _, r in ipairs(list_menu.args.item_table) do
+        if r.backup then pick = r end
+    end
+    assert(pick, "备份列表里要给出一条可点的行")
+    assert_eq("文案带目标版本号", "回退到 v1.0.0", pick.text)
+    list_menu.args.onMenuSelect(list_menu, pick)
+    local confirm = lastConfirm()
+    assert(confirm, "回退要先确认（改的是已装源文件）")
+    confirm.args.ok_callback()
+    assert_eq("按备份版本号回退", 1, #st.restored)
+    assert_eq("回退调用", "a@1.0.0", st.restored[1])
+    assert_eq("回退后要作废引擎缓存", 1, #b.invalidated)
+    assert_eq("key", "a", b.invalidated[1])
+    assert_eq("提示一次", 1, #b.messages)
+    assert(b.messages[1]:find("已回退到 v1.0.0", 1, true),
+        "要说清回到了哪一版: " .. b.messages[1])
     return true
 end
 

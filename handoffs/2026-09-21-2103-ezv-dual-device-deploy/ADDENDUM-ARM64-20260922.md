@@ -4,11 +4,11 @@
 
 ## 已完成（本阶段）
 
-### 1. arm64 引擎编译 ✅（构建机，NDK r27c）
+### 1. arm64 引擎编译 ✅（构建机主机，NDK r27c）
 
 - `libquickjs.so`（arm64-v8a, android-21, 809488B stripped）+ `libezvbridge.so`（5936B，NEEDED 已改为 libquickjs.so）
 - 产物：构建机 `~/ezv/EZVenera_KO/out-android/`，Windows 镜像 `build\android-arm64\`
-- 构建脚本：`/tmp/build_arm64.sh`（cmake toolchain file 方式；坑：`$HOME` 在 ssh heredoc 中被 Windows 展开成 `C:UsersAdministrator`——脚本内**硬编码 ~ 绝对路径**；patchelf 用 NDK 自带 `llvm-patchelf`）
+- 构建脚本：`/tmp/build_arm64.sh`（cmake toolchain file 方式；坑：`$HOME` 在 ssh heredoc 中被 Windows 展开成 `<Windows 用户目录>`——脚本内**硬编码 <构建机家目录> 绝对路径**；patchelf 用 NDK 自带 `llvm-patchelf`）
 - 首次构建产物误为 ARM32：CMake 缓存残留（rm -rf build/quickjs-android 后重配即正确）
 - 源码 sha256 校验通过（v0.17.0 tarball, 559bc4c4…）
 

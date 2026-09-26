@@ -4,7 +4,7 @@
 
 - Created: 2026-09-23 09:05
 - Source agent: Coder（GLM，本会话 = 双崩溃修复 + APK 手术会话）
-- Project: C:\Users\Administrator\Downloads\EZVenera_KO
+- Project: <项目根>
 - Branch: main，HEAD: 766fc60（工作区大量未提交修改 + untracked，见下）
 - OS: win32（NUC-I5）
 
@@ -89,7 +89,7 @@
 
 ### Blocker / 未决
 
-- [ ] 设备无外网（直连全超时）——搜索/分类数据流真机验证需网络恢复或代理（settings 里残留 `http://<DEV-HOST>:<PROXY-PORT>` 代理配置，可用性未验证）
+- [ ] 设备无外网（直连全超时）——搜索/分类数据流真机验证需网络恢复或代理（settings 里残留 `<局域网代理>` 代理配置，可用性未验证）
 - [ ] pump 竞态的精确机制（哪条线程、哪个槽）未完全复盘——S2 落地真泵时若仍崩需 debugger 级分析
 
 ### 延后项
@@ -108,9 +108,9 @@
 - **adb input tap 坐标盲点多**（估算偏移可达 200px）——UI 自动化不可靠，一律"用户手点 + logcat/截图取证"。
 - **nativeLibraryDir 是扁平 `/data/app/<pkg>-N/lib/`**（非 lib/arm64/），安装号 -N 每次重装会变。
 - **该测试平板 force-stop/kill 不可靠**——重启 app 后必须验证新 PID + "loading libluajit-launcher" 日志。
-- **构建机通道**：`ssh build-host-tunnel`（免密可用）；sudo 密码走本地环境；`apt` 已装 apksigner/zipalign；NDK r27c 在 `~/android-ndk`。
+- **构建机通道**：`ssh <构建机 ssh 别名>`（免密可用）；sudo 口令走本地环境；`apt` 已装 apksigner/zipalign；NDK r27c 在 `~/android-ndk`。
 - **构建机上 heredoc 陷阱**：`$HOME` 会被 Windows 展开成 `C:Users...`——脚本一律写本地文件 scp 过去执行（build/apk-engine/ 内有全套现成脚本）。
-- **K4 BusyBox grep 无 -E**；K4 SSH 需 pty（`ssh -tt -p 2222 <USER>@<KINDLE-HOST>`，免密）——K4 冻结中，恢复前不用管。
+- **K4 BusyBox grep 无 -E**；K4 SSH 需 pty（`ssh -tt -p 2222 <USER>@<K4>`，免密）——K4 冻结中，恢复前不用管。
 
 ### 假设
 
@@ -123,11 +123,11 @@
 ### 构建 / 运行 / 测试命令
 
 - 主仓检查：`tools\.venv\Scripts\python.exe scripts\check_syntax.py` + `run_tests.py` + `check_no_hold.py` + `verify_vendored.py`（当前 12/12 · 113/0 · clean · match）
-- 引擎重编（构建机）：`scp build\apk-engine\build_nopatchelf.sh build-host-tunnel:/tmp/ && ssh build-host-tunnel "bash /tmp/build_nopatchelf.sh"`（先跑 build_old_recipe.sh 产出 build/quickjs-android-old/）
+- 引擎重编（构建机）：`scp build\apk-engine\build_nopatchelf.sh <构建机 ssh 别名>:/tmp/ && ssh <构建机 ssh 别名> "bash /tmp/build_nopatchelf.sh"`（先跑 build_old_recipe.sh 产出 build/quickjs-android-old/）
 - APK 重打：`bash /tmp/make_apk3.sh`（构建机）→ scp 回 → `adb uninstall org.koreader.launcher.fdroid && adb install xxx.apk`
 - 设备推送 Lua：`adb push src\koreader-plugin\ezvenera.koplugin\<f> /sdcard/koreader/plugins/ezvenera.koplugin/<f>` → force-stop + monkey 重启（`org.koreader.launcher.fdroid`）
 - inspector：`adb forward tcp:18080 tcp:8080` → `curl http://<IP>:18080/koreader/`
 
 ---
 
-**安全提醒**：定稿前如有 validate_handoff.py（agent-handoff-delivery skill 侧）可跑则跑；检测到密钥或质量分 <70 不得交付。本 handoff 不含任何凭据（构建机 sudo 密码按用户口头提供使用，不入仓——见红线 6）。
+**安全提醒**：定稿前如有 validate_handoff.py（agent-handoff-delivery skill 侧）可跑则跑；检测到密钥或质量分 <70 不得交付。本 handoff 不含任何凭据（构建机 sudo 口令走本地环境，不入仓——见红线 6）。
