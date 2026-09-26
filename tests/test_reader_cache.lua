@@ -353,6 +353,41 @@ function tests.broken_proxy_host_falls_back_to_direct()
     return true
 end
 
+-- 【真机 2026-09-26 xmanhua 空白页】反向情形：图床经代理是通的，只是某一页撞了
+-- sink timeout；旧策略据此把主机永久钉死直连，而该 CDN 直连一律 closed →
+-- 之后整章每页都失败，阅读器停在灰底占位页，用户体感"崩溃"。
+-- 新策略：探测失败就收回可疑标记，下一拍回代理（不钉死、不自愈锁死）。
+function tests.failed_direct_probe_returns_to_proxy()
+    local imgs = urls(1)
+    local seen, n = {}, 0
+    local net = { total = 0 }
+    net.request = function(_, o)
+        net.total = net.total + 1
+        n = n + 1
+        seen[n] = o.proxy
+        if o.proxy ~= "" and n == 1 then
+            return { status = nil, headers = {}, body = nil, error = "sink timeout" }
+        end
+        if o.proxy == "" then
+            return { status = nil, headers = {}, body = nil, error = "closed" }
+        end
+        return { status = 200, headers = {}, body = "IMG:" .. o.url }
+    end
+    local b = Browser.new{ infoMessage = noop, netclient = net,
+        settings = { isProxyEnabled = function() return true end,
+                     getProxyURL = function() return "http://10.0.0.1:8080" end } }
+    assert_eq("proxy page times out", nil,
+        b:fetchImageBytes(imgs[1], nil, nil, { attempts = 1 }))
+    assert_eq("probe goes direct", nil,
+        b:fetchImageBytes(imgs[1], nil, nil, { attempts = 1 }))
+    assert_eq("probe really was direct", "", seen[2])
+    assert_eq("next page is back on the proxy", "IMG:" .. imgs[1],
+        b:fetchImageBytes(imgs[1], nil, nil, { attempts = 1 }))
+    assert_eq("and it used the proxy", "http://10.0.0.1:8080", seen[3])
+    assert_eq("host never pinned direct", nil, b._direct_hosts and b._direct_hosts[imgs[1]])
+    return true
+end
+
 -- 【R9 真机闪退】菜单回调由 KOReader 分发循环直接调用；错误冒到主循环后，
 -- 主循环用 luaL_traceback 生成崩溃报告时自己崩在 libluajit 里（tombstone 02/03
 -- 同一签名）。所以回调入口必须收住错误并转成用户可见提示。

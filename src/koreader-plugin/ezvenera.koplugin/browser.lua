@@ -1168,14 +1168,21 @@ function Browser:fetchImageBytes(url, base_headers, page_headers, opts)
         proxy = (self.settings:isProxyEnabled())
             and self.settings:getProxyURL() or ""
     end
-    -- 【真机 2026-09-24 baozi】代理节点对**部分主机**是不通的（CONNECT 回
-    -- 200 之后一个 TLS 字节都不回），而设备直连同一主机 2s 拿全图。这种主机
-    -- 经代理撞一次传输层失败后就降级为直连（只影响这台主机，代理配置本身不动；
-    -- 每次请求的代理仍由插件显式指定，ADR-003 不破）。
+    -- 【真机 2026-09-24 baozi / 2026-09-26 xmanhua】代理对**部分主机**不通
+    -- （CONNECT 回 200 后一个 TLS 字节都不回，直连 2s 拿全图），另一些主机正好
+    -- 相反（xmanhua 图床：直连被立刻掐断 status=closed，经代理一切正常）。
+    -- 所以路线按「探测—确认」两步走，绝不因一次传输失败就永久改道
+    -- （ADR-003：每次请求的代理仍由插件显式指定）：
+    --   · 已钉死直连（此前探测成功过）→ 本拍直连；
+    --   · 仅可疑（上一拍经代理传输失败）→ 本拍直连探测一次；
+    --   · 探测成功才钉死，探测失败即收回、下一拍回代理。
     local host = url:match("^[%a]+://[^/]+")
-    if proxy ~= nil and proxy ~= "" and self._direct_hosts
-            and self._direct_hosts[host] then
+    local had_proxy = proxy ~= nil and proxy ~= ""
+    local direct_now = false
+    if had_proxy and ((self._direct_hosts and self._direct_hosts[host])
+            or (self._proxy_suspect and self._proxy_suspect[host])) then
         proxy = ""
+        direct_now = true
     end
     -- onLoadFailed 重试链（Venera 语义 5 次 → 冷路径收敛为 2 次，且受预算约束）
     local last
@@ -1198,15 +1205,25 @@ function Browser:fetchImageBytes(url, base_headers, page_headers, opts)
         elseif resp.status ~= 200 or type(resp.body) ~= "string"
                 or resp.body == "" then
             last = "status " .. tostring(resp.status or resp.error)
-            if resp.status == nil and type(proxy) == "string" and proxy ~= "" then
-                self._direct_hosts = self._direct_hosts or {}
-                if not self._direct_hosts[host] then
-                    self._direct_hosts[host] = true
-                    logger.warn("ezvenera: proxy broken for", host,
-                        "→ 本会话该主机改走直连")
+            if resp.status == nil then
+                if direct_now then
+                    -- 直连这一拍也失败：钉过的解开、可疑的收回，下一拍回代理
+                    if self._direct_hosts then self._direct_hosts[host] = nil end
+                    if self._proxy_suspect then self._proxy_suspect[host] = nil end
+                elseif had_proxy then
+                    self._proxy_suspect = self._proxy_suspect or {}
+                    self._proxy_suspect[host] = true
                 end
             end
         else
+            if direct_now and had_proxy and self._proxy_suspect
+                    and self._proxy_suspect[host] then
+                -- 代理刚失败、直连探测就成功 → 判定代理对这台主机不通，钉死直连
+                self._direct_hosts = self._direct_hosts or {}
+                self._direct_hosts[host] = true
+                self._proxy_suspect[host] = nil
+                logger.warn("ezvenera: proxy unusable for", host, "→ 该主机钉死直连")
+            end
             return resp.body, resp.headers
         end
     end
