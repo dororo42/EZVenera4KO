@@ -58,4 +58,35 @@ function stubs.fake_cookies()
         { get_data = function() return data end }
 end
 
+-- jshost 在【模块加载期】捕获 logger，所以想验日志就必须让桩先于 require。
+-- 多个测试文件都要抓日志时，共享这一个入口：每次都装新桩并强制重载 jshost，
+-- 否则「谁先 require 谁赢」会把后写的文件变成假通过。
+function stubs.reload_jshost_with_logger()
+    local sink = { warns = {}, dbgs = {}, infos = {} }
+    local function rec(t)
+        return function(msg, ...)
+            local line = tostring(msg)
+            for i = 1, select("#", ...) do
+                line = line .. " " .. tostring((select(i, ...)))
+            end
+            table.insert(t, line)
+        end
+    end
+    local noop = function() end
+    package.preload["logger"] = function() return {
+        warn = rec(sink.warns), dbg = rec(sink.dbgs), info = rec(sink.infos),
+        err = noop, verbose = noop, setLevel = noop,
+    } end
+    package.loaded["logger"] = package.preload["logger"]()
+    package.loaded["runtime.jshost"] = nil
+    local JsHost = require("runtime.jshost")
+    --- 就地清空（recorder 捕获的是表本身，换新表会把写入留在旧表里）
+    function sink.reset()
+        for i = #sink.warns, 1, -1 do sink.warns[i] = nil end
+        for i = #sink.dbgs, 1, -1 do sink.dbgs[i] = nil end
+        for i = #sink.infos, 1, -1 do sink.infos[i] = nil end
+    end
+    return JsHost, sink
+end
+
 return stubs

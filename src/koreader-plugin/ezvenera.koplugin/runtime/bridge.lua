@@ -22,6 +22,11 @@ cookies / storage …），返回 JSON 可序列化结果或 {__error = "..."}�
 字节串跨桥约定：二进制以 {__bytes_b64 = "..."} 标记；字符串原样传递。
 JS→Lua 方向由 jshost 的 glue（sendMessage 前遍历标记）；Lua→JS 方向由
 glue 的 __ezv_untag_bytes 还原为 ArrayBuffer（2026-09-20 实现，design.md §3.2）。
+
+r10 M2（2026-09-27）：async_http 打开时，http 请求不再当场阻塞，而是回
+{__pending = <id>}；glue 把该标记变成真 Promise，结果由 jshost 泵经
+Bridge:takeHttpReady() 取回后 eval __ezv_resolve 兑现。关闭（默认）时
+逐字节走老同步路径。两条路共用 _httpOpts / httpFinish，错误形状一致。
 ]]
 
 local Bridge = {}
@@ -69,6 +74,11 @@ function Bridge.new(deps)
     o.json = deps.json
     o.platform = deps.platform or "koreader"
     o.locale = deps.locale or "zh_CN"
+    -- r10 M2 异步 http 通道状态（开关默认关：见 handlers["http"] 的说明）
+    o.async_http = deps.async_http == true
+    o._http_seq = 0
+    o._http_jobs = {}
+    o._http_ready = {}
     return o
 end
 
@@ -119,8 +129,9 @@ end
 
 -- ---- http（http_method 为动词字段；data 为请求体；bytes 决定 body 形态）----
 
-handlers["http"] = function(self, msg)
-    if not msg.url then return { __error = "http: missing url" } end
+--- 请求组装（同步 / 异步两条路共用；改动只落一处才不会两边漂移）。
+--- 返回 netclient:request 的 opts。
+function Bridge:_httpOpts(msg)
     local headers = {}
     for k, v in pairs(msg.headers or {}) do
         headers[k] = v
@@ -162,13 +173,20 @@ handlers["http"] = function(self, msg)
             and self.settings:getProxyURL() or ""
         -- 显式禁用也传空串：不受 KOReader 全局 PROXY 影响（ADR-003）
     end
-    local resp = self.netclient:request({
+    return {
         url = msg.url,
         method = msg.http_method or "GET",
         headers = headers,
         body = body,
         proxy = proxy,
-    })
+    }
+end
+
+--- 响应 → 桥结果（两条路共用）。网络失败在这里**不**翻译成 __error：
+--- 源的判定是 `status !== 200` / 自查 `result.error`，同步路径一直就是这个
+--- 形状，异步路径换形状等于改了源的错误语义。
+local function httpFinish(self, msg, resp)
+    resp = resp or {}
     -- 记录 set-cookie
     if self.cookies then
         pcall(function()
@@ -185,6 +203,70 @@ handlers["http"] = function(self, msg)
         end
     end
     return out
+end
+
+--- r10 M2：发起一次非阻塞请求，立刻返回挂起 id。
+--- 完成回调由 `NetClient:tickAsync` 触发（= jshost 泵的这一拍），结果进
+--- `_http_ready`，泵随后 eval `__ezv_resolve` 把它兑现给 JS。
+--- 返回 nil 表示没接上异步通道（调度器 / socket.select 不可用），调用方
+--- 退回阻塞请求——降级方向必须是「和以前一样」，不是「请求消失」。
+function Bridge:_httpStart(msg, opts)
+    local id = (self._http_seq or 0) + 1
+    self._http_seq = id
+    local job, aerr = self.netclient:requestAsync(opts,
+        function(_, result)
+            -- 已被 abort 的任务不再投递：完成回调晚一拍才跑，而那时 ctx
+            -- 可能已经换成另一个引擎，resolve 打进不存在/陌生的 id 没有意义
+            if not self._http_jobs[id] then return end
+            self._http_jobs[id] = nil
+            local resp = (type(result) == "table") and result
+                or { error = tostring(result or aerr or "no response") }
+            local ready = self._http_ready
+            ready[#ready + 1] = { id = id, out = httpFinish(self, msg, resp) }
+        end)
+    if not job then return nil end
+    self._http_jobs[id] = job
+    return id
+end
+
+--- 取走并清空「已完成」的异步 http 结果（jshost 泵调用）。
+function Bridge:takeHttpReady()
+    local ready = self._http_ready
+    if #ready == 0 then return nil end
+    self._http_ready = {}
+    return ready
+end
+
+--- 在飞的异步请求数（泵用它决定这一拍要不要跑快点）。
+function Bridge:httpInflight()
+    local n = 0
+    for _ in pairs(self._http_jobs) do n = n + 1 end
+    return n + #self._http_ready
+end
+
+--- 丢弃全部在飞请求（引擎关闭 / 泵停摆）：取消会同步硬关 socket，
+--- 否则这些 fd 要等到对端超时才还不回来。
+function Bridge:abortHttp()
+    local jobs = self._http_jobs
+    self._http_jobs = {}
+    self._http_ready = {}
+    local n = 0
+    for _, job in pairs(jobs) do
+        if job.cancel then job:cancel() end
+        n = n + 1
+    end
+    return n
+end
+
+handlers["http"] = function(self, msg)
+    if not msg.url then return { __error = "http: missing url" } end
+    local opts = self:_httpOpts(msg)
+    -- 开关由宿主在「泵确实会跑」之后打开：挂起标记没人兑现等于请求永丢
+    if self.async_http and self.netclient.requestAsync then
+        local id = self:_httpStart(msg, opts)
+        if id then return { __pending = id } end
+    end
+    return httpFinish(self, msg, self.netclient:request(opts))
 end
 
 -- ---- convert（type 分派；二进制一律 {__bytes_b64} 标记）----

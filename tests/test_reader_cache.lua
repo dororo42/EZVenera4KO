@@ -15,7 +15,18 @@ local fake = {
     viewer_args = nil,
 }
 
-stub("logger", { warn = noop, info = noop, err = noop, dbg = noop, verbose = noop })
+-- logger.warn 收进 warn_log：图片 URL 形状的断言要看「日志说了什么、有没有
+-- 漏出签名 token」，全 noop 等于没测。
+local warn_log = {}
+local function clearWarns() warn_log = {} end
+local function warnText() return table.concat(warn_log, "\n") end
+stub("logger", {
+    warn = function(...)
+        local buf = {}
+        for i = 1, select("#", ...) do buf[i] = tostring(select(i, ...)) end
+        table.insert(warn_log, table.concat(buf, " "))
+    end,
+    info = noop, err = noop, dbg = noop, verbose = noop })
 stub("gettext", setmetatable({}, { __call = function(_, s) return s end }))
 stub("ui/uimanager", {
     show = function(_, w) table.insert(fake.shown, w) end,
@@ -36,25 +47,35 @@ stub("ui/widget/imageviewer", {
         -- 真机 ImageViewer:init 在取第一页的同时把 _images_list_cur 置 1
         -- （imageviewer.lua:145-149），延迟首屏的补画要拿它比对当前页。
         local v = { __viewer = true, free = noop, _images_list_cur = 1,
-                    updates = 0 }
+                    updates = 0, image = nil }
         function v:update()
             self.updates = self.updates + 1
             fake.viewer_updates = self.updates
         end
+        fake.viewer = v
         return v
     end,
 })
 local decoded = 0
--- 真机 BB 是 FFI cdata，带 stride/h（browser.lua 按 stride*h 记解码内存预算）
+local freed_bbs = 0
+-- 真机 BB 是 FFI cdata，带 stride/h（browser.lua 按 stride*h 记解码内存预算）。
+-- 二次 free 在 LuaJIT 里只是 no-op（blitbuffer.lua:1472 先清 ALLOCATED 再
+-- ffi.gc(self,nil)），所以这里不设断言，只数「逐出时到底回收了几次」。
+local function bbFree(self)
+    if not self.__freed then
+        self.__freed = true
+        freed_bbs = freed_bbs + 1
+    end
+end
 stub("ui/renderimage", {
     renderImageData = function(_, data)
         decoded = decoded + 1
-        return { __bb = true, data = data, free = noop, stride = 600, h = 800 }
+        return { __bb = true, data = data, free = bbFree, stride = 600, h = 800 }
     end,
 })
 stub("ffi/blitbuffer", {
     TYPE_BB8 = 1, COLOR_GRAY_E = 233, COLOR_WHITE = 255,
-    new = function() return { __bb = true, fill = noop, free = noop } end,
+    new = function() return { __bb = true, fill = noop, free = bbFree } end,
 })
 -- KOReader 的 json 模块在测试环境不存在；浏览器只用它解 eval 结果，
 -- 本测试全部走 _awaitSource 桩，不会触及。
@@ -83,6 +104,9 @@ local function makeReader(images, opts)
     end
     fake.shown, fake.closed, fake.scheduled = {}, {}, {}
     fake.viewer_args = nil
+    fake.viewer = nil
+    decoded = 0
+    freed_bbs = 0
     local b = Browser.new{ infoMessage = noop, netclient = net,
                            page_cache_bytes = opts.cache_budget,
                            page_bb_bytes = opts.bb_budget }
@@ -250,25 +274,57 @@ function tests.cache_evicts_over_byte_budget()
     return true
 end
 
--- 解码 BB 独立预算：BB 是内存大头（一页 600x800 BB8 ≈ 0.45MB），逐出时
--- 正在显示的那一页绝不能被逐（否则交出无引用的 BB 会被终值器回收）。
+-- 解码 BB 独立预算：BB 是内存大头（一页 600x800 BB8 ≈ 0.45MB），逐出的是
+-- 「最久未用且不在屏幕上」的那一页；屏幕上那一页绝不逐（交给终值器的 BB 会
+-- 在重绘途中被回收），逐出的必须当场 :free()，字节仍留在缓存里。
 function tests.bb_evicts_over_bb_budget_keeps_current_page()
     local imgs = urls(4)
     -- 每页 BB = 600*800 = 480000B；预算 1MB → 最多留 2 页
     local b, net = makeReader(imgs, { bb_budget = 1024 * 1024 })
     b:showReader("baozi", "c1", "7", "t", "第7话")
     local pt = fake.viewer_args.image
+    touch(pt, 1)
+    runScheduled(1)          -- 首屏由节拍取回并补画 → 页 1 就是屏幕上那一页
     local bb1 = pt[1]
-    runScheduled(1)          -- 首屏由节拍取回，页 1 进缓存/解码预算
-    bb1 = pt[1]
-    local d0 = decoded
-    assert(pt[2] ~= nil and pt[3] ~= nil, "later pages decode")
-    assert(decoded - d0 >= 2, "pages 2,3 decoded")
-    -- 页 1 的 BB 已被预算逐出 → 翻回去重新解码（字节仍在缓存，不再下载）
-    local bb1b = pt[1]
-    assert_eq("evicted page re-decoded", true, bb1b ~= bb1)
-    assert_eq("bytes still cached, no re-download", 1, net.hits[imgs[1]])
-    assert_eq("current page still a BB", true, pt[3].__bb)
+    assert_eq("补画把当前页交给了 viewer", true, fake.viewer.image == bb1)
+    local bb2, bb3 = pt[2], pt[3]
+    -- 页 3 解码后超预算：逐掉不在屏幕上的最旧一页（页 2），页 1 留住
+    assert_eq("on-screen page kept", nil, bb1.__freed)
+    assert_eq("off-screen page freed at eviction", true, bb2.__freed)
+    assert_eq("newest page not freed", nil, bb3.__freed)
+    -- 逐出只丢解码结果：翻回去重新解码，但字节仍在缓存，不再下载
+    assert_eq("evicted page re-decoded", true, pt[2] ~= bb2)
+    assert_eq("bytes still cached, no re-download", 1, net.hits[imgs[2]])
+    assert_eq("current page still a BB", true, pt[1].__bb)
+    assert(freed_bbs >= 1, "eviction must call free() at once")
+    return true
+end
+
+-- 屏幕上那一页的 BB 永不被逐出回收：换页瞬间 viewer.image 还是上一页，
+-- 预取节拍触发逐出时它是当前页 —— 两种情况都由「仍在引用」判据挡住。
+-- 翻走之后它失去保护，下一次超预算就该回收，否则就是真机那 2.13 GB。
+function tests.bb_on_screen_is_never_freed_by_eviction()
+    local imgs = urls(5)
+    -- 每页 BB = 480000B；预算 1MB → 只装得下 2 页，第 3 页必触发逐出
+    local b = makeReader(imgs, { bb_budget = 1024 * 1024 })
+    b:showReader("baozi", "c1", "7", "t", "第7话")
+    local pt = fake.viewer_args.image
+    touch(pt, 1)
+    runScheduled(1)
+    local bb1 = pt[1]
+    fake.viewer.image = bb1              -- 页 1 正在屏幕上
+    local bb2 = pt[2]
+    local bb3 = pt[3]
+    assert_eq("on-screen page untouched", nil, bb1.__freed)
+    assert_eq("off-screen page freed", true, bb2.__freed)
+    assert_eq("new page not freed", nil, bb3.__freed)
+    -- 翻走之后页 1 不再是当前页：下一次超预算就该回收它
+    fake.viewer.image = bb3
+    local f0 = freed_bbs
+    local bb4, bb5 = pt[4], pt[5]
+    assert_eq("page freed after it left the screen", true, bb1.__freed)
+    assert(freed_bbs > f0, "failed later eviction must free too")
+    assert_eq("page being served is not freed", nil, bb5.__freed)
     return true
 end
 
@@ -425,6 +481,42 @@ function tests.progress_toast_dismisses_but_errors_stay_modal()
     assert_eq("error routed to modal infoMessage", 1, #modal)
     assert(modal[1]:find("network down", 1, true),
         "error text surfaced: " .. tostring(modal[1]))
+    return true
+end
+
+-- 【真机 2026-09-27 doubaomanhua】站点把 chapter_images 换成绝对 URL，源 JS 仍
+-- 按相对路径拼 imgBase ⇒ 路径里出现第二个 scheme，图床回 500（不是 404），用户
+-- 读作「图片打不开」而日志看着像网络故障。宿主的处置：先于网络判掉（一次请求
+-- 都不发，最多 4.5s 的重试预算省下来），错误里点名是源的锅。
+function tests.double_hosted_image_url_is_rejected_before_the_network()
+    local b, net = makeReader(urls(1))
+    clearWarns()
+    local bad = "https://s1.baozicdn.com/https://s1.bzcdn.net/comic/1.webp"
+    local data, err = b:fetchImageBytes(bad, nil, nil, { attempts = 1 })
+    assert_eq("no bytes", nil, data)
+    assert(err and err:find("double-hosted", 1, true),
+        "err names the culprit: " .. tostring(err))
+    assert_eq("and not a single request went out", 0, net.total)
+    assert_eq("the reason is logged once", 1, #warn_log)
+    assert(warnText():find("https://s1.baozicdn.com", 1, true), "host logged")
+    return true
+end
+
+-- 同一函数的反例，钉住判据不能过宽：查询串里带 `://` 是合法值（签名/回跳参数），
+-- 绝对不许把它当成「主机拼了两遍」而拒掉；同时断言签名 token 不进 logcat。
+function tests.scheme_in_query_is_a_value_not_a_second_host()
+    local imgs = urls(1)
+    local signed = imgs[1] .. "?next=http://other/x.webp&sign=deadbeef"
+    local b, net = makeReader(imgs, { fail_urls = { [signed] = true } })
+    clearWarns()
+    assert_eq("still fetched, so not rejected", nil,
+        b:fetchImageBytes(signed, nil, nil, { attempts = 1 }))
+    assert_eq("the request really went out", 1, net.total)
+    local txt = warnText()
+    assert(txt:find("https://cdn.example.com", 1, true), "host logged: " .. txt)
+    assert(txt:find("/1.webp", 1, true), "query-stripped path logged: " .. txt)
+    assert(not txt:find("deadbeef", 1, true), "no token in logcat")
+    assert(not txt:find("next=http", 1, true), "no query in logcat")
     return true
 end
 

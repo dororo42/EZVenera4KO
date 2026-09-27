@@ -20,6 +20,10 @@ local function assert_eq(label, expected, actual)
         label .. ": expected " .. tostring(expected) .. ", got " .. tostring(actual))
 end
 
+local function assert_true(label, v)
+    assert(v, label .. ": 期望真值，得到 " .. tostring(v))
+end
+
 --- 只替 _awaitSource：optionList 声明直接由表提供
 local function makeBrowser(decls)
     local b = setmetatable({}, { __index = Browser })
@@ -132,12 +136,23 @@ function tests.call_sites_pass_context()
     local f = assert(package.searchpath("browser", package.path))
     local src = assert(io.open(f, "rb")):read("a")
     local n = 0
-    for call in src:gmatch('self:_defaultOptions%(([^%)]*)%)') do
+    -- 【r10 M3】调用点现在可以在 (key, methodPath, ctx) 之后再多一个 on_done
+    -- 续体，所以判定只看**前三个**实参——续体不参与（旧写法用 `[^%)]*` 会在
+    -- `function(options)` 的右括号处断掉，把续体参数算进逗号数）。
+    for call in src:gmatch('self:_defaultOptions%(([^\n]*)') do
         n = n + 1
-        local commas = select(2, call:gsub(",", ""))
-        assert_eq("call site has ctx arg: " .. call, 2, commas)
+        local parts = {}
+        for seg in (call .. ","):gmatch("([^,]+),") do
+            parts[#parts + 1] = seg
+        end
+        assert_true("调用点带 key: " .. call,
+            (parts[1] or ""):find("key", 1, true) ~= nil)
+        assert_true("调用点带 methodPath: " .. call,
+            (parts[2] or ""):find('"', 1, true) ~= nil)
+        assert_true("调用点带 ctx: " .. call,
+            (parts[3] or "") ~= "")
     end
-    assert_eq("three call sites", 3, n)
+    assert_eq("三个调用点", 3, n)
     return true
 end
 

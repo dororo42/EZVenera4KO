@@ -337,4 +337,31 @@ function tests.settings_autoflush_error_is_contained()
     return true
 end
 
+-- r10 M3 真机点验（探针 ezvm3）判定：异步通道一翻开，https 源的源调用当场坏
+-- （`asyncnet.lua:109: attempt to yield across C-call boundary`）。所以默认关，
+-- 「开」只能是显式 opt-in（真机回滚=改一行设置，不必重推代码）。
+-- 三种形状都要钉住：没写过→关；显式 true→开；`self.async_http` 钉子优先。
+function tests.async_http_defaults_off_and_only_explicit_on()
+    local inst = newInstance(fakeBrowser())
+    assert_eq("没有设置也没有钉子 ⇒ 关", false, inst:_asyncHttpWanted())
+    G_reader_settings = { readSetting = function() return nil end }
+    assert_eq("设置里没写过 ⇒ 仍然关", false, inst:_asyncHttpWanted())
+    G_reader_settings = { readSetting = function(_, k)
+        if k == "ezvenera_async_http" then return true end
+        return nil
+    end }
+    assert_eq("显式 true ⇒ 开", true, inst:_asyncHttpWanted())
+    G_reader_settings = { readSetting = function(_, k)
+        if k == "ezvenera_async_http" then return false end
+        return nil
+    end }
+    assert_eq("显式 false ⇒ 关", false, inst:_asyncHttpWanted())
+    G_reader_settings = nil
+    inst.async_http = true
+    assert_eq("钉子优先于默认关", true, inst:_asyncHttpWanted())
+    inst.async_http = false
+    assert_eq("钉子显式关", false, inst:_asyncHttpWanted())
+    return true
+end
+
 return tests

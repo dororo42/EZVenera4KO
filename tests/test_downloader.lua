@@ -86,39 +86,51 @@ function tests.repeat_download_is_skipped()
     return true
 end
 
--- 中途失败：不留半截 manifest 也不留脏文件；网络恢复后重下能成
-function tests.failed_download_leaves_no_manifest()
+-- 中途失败：已下页留着（complete=0），恢复后只补剩下的页，不重下整章
+function tests.failed_download_keeps_pages_and_resumes()
     local dl, fs, env = makeDL({ bad_urls = { [URLS[2]] = true } })
     local ok, err = withImages(dl)
     assert_eq("not ok", false, ok)
     assert(tostring(err):find("第 2 页", 1, true), "page-scoped error: " .. tostring(err))
-    assert_eq("no manifest", nil, dl:manifestOf("baozi", "c1", "0_17"))
-    for p in pairs(fs.state.files) do error("leftover file " .. p) end
+    assert_eq("not offered as downloaded", nil, dl:manifestOf("baozi", "c1", "0_17"))
+    local part = dl:partialOf("baozi", "c1", "0_17")
+    assert(part, "partial manifest kept")
+    assert_eq("1 page kept", 1, #part.pages)
+    local dir = dl:dirOf("baozi", "c1", "0_17")
+    assert_eq("page 1 bytes on disk", "IMG:" .. URLS[1], fs.state.files[dir .. "/0001.webp"])
     env.bad = {}
-    local ok2 = withImages(dl)
-    assert_eq("retry after failure succeeds", true, ok2)
-    assert_eq("now downloadable", 3, #dl:manifestOf("baozi", "c1", "0_17").pages)
+    local n0 = #env.reqs
+    local ok2, man2 = withImages(dl)
+    assert_eq("resume succeeds", true, ok2)
+    assert_eq("only missing pages fetched", 2, #env.reqs - n0)
+    assert_eq("all pages now", 3, #man2.pages)
+    assert_eq("complete after resume", true, man2.complete ~= false)
+    assert_eq("no partial left", nil, dl:partialOf("baozi", "c1", "0_17"))
     return true
 end
 
--- 取消：on_progress 返回 false 即中止，同样清干净不占空间
-function tests.cancel_removes_partial()
+-- 取消：on_progress 返回 false 即中止，字节留着等下次续
+function tests.cancel_keeps_pages_for_resume()
     local dl, fs = makeDL()
     local ok, err = withImages(dl, nil, {
         on_progress = function() return false end })
     assert_eq("not ok", false, ok)
     assert_eq("reason", "已取消", err)
-    for p in pairs(fs.state.files) do error("leftover file " .. p) end
-    assert_eq("nothing recorded", nil, dl:manifestOf("baozi", "c1", "0_17"))
+    assert_eq("nothing offered as downloaded", nil, dl:manifestOf("baozi", "c1", "0_17"))
+    local part = dl:partialOf("baozi", "c1", "0_17")
+    assert(part, "partial kept")
+    assert_eq("page 1 survives", "IMG:" .. URLS[1],
+        fs.state.files[dl:dirOf("baozi", "c1", "0_17") .. "/0001.webp"])
     return true
 end
 
--- 逐页步进（UI 不冻结的形态）：每 step 只发一个请求，中途置 stopped 也能清干净
+-- 逐页步进（UI 不冻结的形态）：每 step 只发一个请求，中途置 stopped 也留字节
 function tests.step_advances_one_page_at_a_time()
     local dl, fs, env = makeDL()
     local job, err = dl:begin({ key = "baozi", comicId = "c1", epId = "0_17",
                                 comicTitle = "T", chapterTitle = "U", images = URLS })
     assert(job, "begin: " .. tostring(err))
+    assert_eq("fresh start", 0, job.resumed)
     local s1, d1 = dl:step(job)
     assert_eq("first step runs", "run", s1)
     assert_eq("one page per step", 1, d1)
@@ -128,7 +140,67 @@ function tests.step_advances_one_page_at_a_time()
     local s3, info = dl:step(job)
     assert_eq("stopped step errors", "error", s3)
     assert_eq("reason", "已取消", info)
-    for p in pairs(fs.state.files) do error("leftover file " .. p) end
+    assert_eq("page 1 still on disk", "IMG:" .. URLS[1],
+        fs.state.files[dl:dirOf("baozi", "c1", "0_17") .. "/0001.webp"])
+    -- 下一次 begin 从第 2 页续：resumed 计数 + 只补 2 页
+    local job2 = dl:begin({ key = "baozi", comicId = "c1", epId = "0_17",
+                            comicTitle = "T", chapterTitle = "U", images = URLS })
+    assert_eq("resumes from page 2", 1, job2.resumed)
+    dl:step(job2)
+    dl:step(job2)
+    assert_eq("only the 2 missing pages re-fetched", 3, #env.reqs)
+    assert_eq("chapter complete after resume", 3, #dl:manifestOf("baozi", "c1", "0_17").pages)
+    return true
+end
+
+-- 续传的硬条件：URL 逐位相同。签名图床重取列表会换 token，这时必须重下
+function tests.resume_requires_identical_page_urls()
+    local dl, _, env = makeDL()
+    withImages(dl, nil, { on_progress = function() return false end })
+    assert_eq("partial exists", 1, #dl:partialOf("baozi", "c1", "0_17").pages)
+    local moved = { "https://cdn.example.com/p1.webp?sig=NEW", URLS[2], URLS[3] }
+    local n0 = #env.reqs
+    local job = dl:begin({ key = "baozi", comicId = "c1", epId = "0_17",
+                           comicTitle = "T", chapterTitle = "U", images = moved })
+    assert_eq("url changed → no reuse", 0, job.resumed)
+    local ok = dl:download({ key = "baozi", comicId = "c1", epId = "0_17",
+                             comicTitle = "T", chapterTitle = "U", images = moved })
+    assert_eq("fresh download ok", true, ok)
+    assert_eq("all 3 pages re-fetched", 3, #env.reqs - n0)
+    return true
+end
+
+-- 未完成章不进「已下载」表、不计体积，但能被列出来单独删；clearAll 一起清
+function tests.partials_are_listed_separately_and_cleared()
+    local dl = makeDL()
+    withImages(dl)                                   -- 完整 1 章
+    withImages(dl, nil, { key = "baozi2", comicId = "c1", epId = "0_17",
+                          on_progress = function() return false end })  -- 未完成 1 章
+    assert_eq("complete chapters", 1, #dl:list())
+    local parts = dl:listPartials()
+    assert_eq("partials", 1, #parts)
+    assert_eq("partial has 1 page", 1, #parts[1].pages)
+    local want_bytes = #("IMG:" .. URLS[1]) + #("IMG:" .. URLS[2]) + #("IMG:" .. URLS[3])
+    assert_eq("usage counts complete only", want_bytes, dl:usage())
+    assert_eq("clearAll removes both", 2, dl:clearAll())
+    assert_eq("nothing complete left", 0, #dl:list())
+    assert_eq("nothing partial left", 0, #dl:listPartials())
+    return true
+end
+
+-- 向后兼容：本次改动之前写的 manifest 没有 complete 行，必须仍算完整可离线
+function tests.legacy_manifest_without_complete_is_downloaded()
+    local dl, fs = makeDL()
+    withImages(dl)
+    local path = Downloader.manifestPath(dl:dirOf("baozi", "c1", "0_17"))
+    local text = fs.state.files[path]
+    assert(text, "manifest exists")
+    fs.state.files[path] = (text:gsub("complete\t1\n", ""))
+    assert_eq("legacy line dropped", nil,
+        fs.state.files[path]:match("complete"))
+    local m = dl:manifestOf("baozi", "c1", "0_17")
+    assert_eq("still offered", 3, #m.pages)
+    assert_eq("still in list()", 1, #dl:list())
     return true
 end
 

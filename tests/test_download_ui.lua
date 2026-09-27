@@ -184,8 +184,8 @@ function tests.download_steps_one_page_per_tick()
     return true
 end
 
--- 取消：点对话框关闭即中止，半截文件清干净（否则占空间又读不出来）
-function tests.dismissing_dialog_cancels_and_prunes()
+-- 取消：点对话框关闭即在页边界中止，已下的页留着（下次从断点续），但不算已下载
+function tests.dismissing_dialog_cancels_and_keeps_pages()
     local b, dl, fs, net = makeBrowser()
     local out = {}
     b:downloadChapter("baozi", "c1", "7", "航海王", "第7话",
@@ -196,8 +196,25 @@ function tests.dismissing_dialog_cancels_and_prunes()
     assert_eq("stops at the page boundary", 1, net.total)
     assert_eq("cancelled", false, out.ok)
     assert_eq("reason", "已取消", out.info)
-    assert_eq("partials cleaned", 0, fileCount(fs))
+    assert_eq("page 1 + partial manifest kept", 2, fileCount(fs))
     assert_eq("nothing offered as offline", nil, dl:manifestOf("baozi", "c1", "7"))
+    assert_eq("partial visible for resume", 1, #dl:partialOf("baozi", "c1", "7").pages)
+    return true
+end
+
+-- 续传（真机痛点：弱网下到一半断掉，重下等于把流量再花一遍）
+function tests.resume_after_cancel_only_fetches_missing_pages()
+    local b, dl, _, net = makeBrowser()
+    b:downloadChapter("baozi", "c1", "7", "航海王", "第7话", function() end)
+    fake.pb[1].args.dismiss_callback()
+    runTick()
+    assert_eq("cancelled after 1 page", 1, net.total)
+    fake.pb, fake.scheduled = {}, {}
+    local out = downloadAll(b)
+    assert_eq("resumed and finished", true, out.ok)
+    assert_eq("only the 2 missing pages fetched", 3, net.total)
+    assert_eq("now offline readable", 3, #dl:manifestOf("baozi", "c1", "7").pages)
+    assert_eq("partial replaced by complete", nil, dl:partialOf("baozi", "c1", "7"))
     return true
 end
 
@@ -435,7 +452,7 @@ end
 -- 菜单回调里出错不许冒到主循环（R9：错误逃出 = 整应用闪退）
 function tests.download_error_does_not_escape()
     local b = makeBrowser()
-    b._loadEpImages = function() error("boom in ep load") end
+    b._loadEpImagesAsync = function() error("boom in ep load") end
     fake.shown = {}
     b:showDetail("baozi", { id = "c1", title = "航海王" })
     local detail = shownMenus()[1]

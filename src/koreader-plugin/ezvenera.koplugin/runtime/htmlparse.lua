@@ -235,29 +235,82 @@ local function splitTop(s, sep)
     return out
 end
 
+--- 复合选择器 → token 列表。`[` 起必须一直吃到配对的 `]`：属性值里可以出现
+--- `.` `#` 和空格（`[href*=".html"]`、`[class*="col- x"]`），按 `.`/`#` 无脑
+--- 切分会把前者劈成 `[href*="` + `.html` + `"]` → 静默 0 命中。
+local function compoundTokens(s)
+    local out, i, n = {}, 1, #s
+    while i <= n do
+        local c = s:sub(i, i)
+        if c == " " or c == "\t" then
+            i = i + 1
+        else
+            local j
+            if c == "[" then
+                -- 含右括号本身：token 必须是完整的 `[attr=val]`
+                local close = s:find("]", i, true)
+                j = close and (close + 1) or (n + 1)
+            else
+                j = i + 1
+                while j <= n do
+                    local cj = s:sub(j, j)
+                    if cj == "[" or cj == "." or cj == "#" then break end
+                    j = j + 1
+                end
+            end
+            table.insert(out, s:sub(i, j - 1))
+            i = j
+        end
+    end
+    return out
+end
+
+--- 属性选择子：[a] [a=v] [a*=v] [a^=v] [a$=v] [a~=v] [a|=v]，值带引号或裸写都行。
+--- 【2026-09-26 真机】旧实现只认 `=`，`class*=` 被当成名为 `class*` 的属性
+--- → 恒 nil → 恒不匹配，且不报错。豆包漫画的 `li[class*=col-]` 正好踩中：
+--- HTTP 200、html parse、querySelectorAll 全部落进日志，然后列表空 →
+--- 用户看到的是"搜索/分类点了不可用"。装机 20 源里共 29 处 `*=`/`^=`。
+local function matchAttr(el, tok)
+    local inner = tok:sub(2, -2)          -- 去掉两侧的 [ ]
+    local name, op, raw = inner:match(
+        "^%s*([%w_%-:]+)%s*([~^$*|]?=)%s*(.-)%s*$")
+    if not name then
+        name = inner:match("^%s*([%w_%-:]+)%s*$")
+        if not name then return false end -- 认不出的形状宁可不匹配
+    end
+    local av = el.attrs[name:lower()]
+    if av == nil then return false end
+    if not op then return true end        -- 只要求存在
+    local val = (raw:gsub('^"(.*)"$', "%1"):gsub("^'(.*)'$", "%1"))
+    if op == "=" then
+        return av == val
+    elseif op == "*=" then
+        return val == "" or av:find(val, 1, true) ~= nil
+    elseif op == "^=" then
+        return val == "" or av:sub(1, #val) == val
+    elseif op == "$=" then
+        return val == "" or av:sub(-#val) == val
+    elseif op == "~=" then
+        if val == "" or val:find("%s") then return false end
+        return (" " .. av .. " "):find(" " .. val .. " ", 1, true) ~= nil
+    else
+        -- |=：整值相等，或以「值-」开头（语言/命名空间前缀）
+        return av == val or av:sub(1, #val + 1) == val .. "-"
+    end
+end
+
 local function matchesCompound(el, compound)
     if not el or not compound or compound == "" then return false end
-    for tok in compound:gmatch("[#%.%[]?[^#%.%[]+") do
-        if tok and tok ~= "" then
-            local c1 = tok:sub(1, 1)
-            if c1 == "#" then
-                if el.id ~= tok:sub(2) then return false end
-            elseif c1 == "." then
-                if not el.classes[tok:sub(2)] then return false end
-            elseif c1 == "[" then
-                local attr, val = tok:match("^%[([^=%]]+)=([^%]]*)%]$")
-                if attr then
-                    local av = el.attrs[attr:lower()]
-                    if av == nil then return false end
-                    val = val:gsub('^"(.*)"$', "%1"):gsub("^'(.*)'$", "%1")
-                    if av ~= val then return false end
-                else
-                    local a2 = tok:match("^%[([^%]]+)%]$")
-                    if a2 and el.attrs[a2:lower()] == nil then return false end
-                end
-            else
-                if tok ~= "*" and el.tag ~= tok:lower() then return false end
-            end
+    for _, tok in ipairs(compoundTokens(compound)) do
+        local c1 = tok:sub(1, 1)
+        if c1 == "#" then
+            if el.id ~= tok:sub(2) then return false end
+        elseif c1 == "." then
+            if not el.classes[tok:sub(2)] then return false end
+        elseif c1 == "[" then
+            if not matchAttr(el, tok) then return false end
+        elseif tok ~= "*" then
+            if el.tag ~= tok:lower() then return false end
         end
     end
     return true
@@ -295,26 +348,38 @@ local function queryImpl(roots, selector)
         if group ~= "" then
             local parts, cur = {}, {}
             local childNext = false
-            for i = 1, #group do
-                local ch = group:sub(i, i)
-                if ch == ">" then
-                    if #cur > 0 then
-                        table.insert(parts, { comb = table.concat(cur), child = false })
-                        cur = {}
-                    end
-                    childNext = true
-                elseif ch == " " then
-                    if #cur > 0 then
-                        table.insert(parts, { comb = table.concat(cur), child = false })
-                        cur = {}
-                    end
-                else
-                    table.insert(cur, ch)
+            -- childNext 只在真正落一个 part 时消费并复位：`a>b c` 里 c 是 b 的
+            -- **后代**而非子元素，旧写法把 child 标记错位一格。
+            local function flush()
+                if #cur > 0 then
+                    table.insert(parts,
+                        { comb = table.concat(cur), child = childNext })
+                    cur = {}
+                    childNext = false
                 end
             end
-            if #cur > 0 then
-                table.insert(parts, { comb = table.concat(cur), child = childNext })
+            local i = 1
+            while i <= #group do
+                local ch = group:sub(i, i)
+                if ch == "[" then
+                    -- 属性段整体吃掉：值里可以有空格和 `>`（`[href*="a>b"]`），
+                    -- 逐字符扫描会把它当成组合子劈开
+                    local close = group:find("]", i, true) or #group
+                    table.insert(cur, group:sub(i, close))
+                    i = close + 1
+                elseif ch == ">" then
+                    flush()
+                    childNext = true
+                    i = i + 1
+                elseif ch == " " or ch == "\t" then
+                    flush()
+                    i = i + 1
+                else
+                    table.insert(cur, ch)
+                    i = i + 1
+                end
             end
+            flush()
             local cands = {}
             for _, r in ipairs(roots) do
                 if r.tag then

@@ -1,8 +1,9 @@
 -- M2 T17: browser.lua —— 浏览 UI（R3.5）
 -- 流程：源列表 → 分类/搜索 → 结果列表 → 详情 → 章节 → T18 阅读器
 -- 组件范式：opds.koplugin（Menu:new + onMenuSelect + UIManager:show/close）
--- 异步：源方法多为 async（返回 promise）——eval 内置同步泵排空微任务，
--- 结果经 __ezv_ret 槽位取回（见 _awaitSource）。长请求经 netclient 短超时。
+-- 异步：源方法多为 async（返回 promise）——eval 内置同步泵排空微任务，结果经
+-- __ezv_ret[槽号] 取回（见 _startAwait/_slotResult）；桥开了 async_http 时
+-- 当拍没结果就跨拍等（_awaitSourceAsync，r10 M3）。长请求经 netclient 短超时。
 
 local UIManager = require("ui/uimanager")
 local Menu = require("ui/widget/menu")
@@ -85,6 +86,18 @@ local function errHint(err)
     return ""
 end
 
+--- 墙钟秒。ffi/util 有单调时钟就用它，没有（单测/Kindle 老端口）退回 os.time。
+--- await 步进器的超时预算按它计，所以上面必须在 `_awaitSource*` 之前可见。
+local function nowSec()
+    local ok, ffiutil = pcall(require, "ffi/util")
+    local gt = ok and type(ffiutil) == "table" and ffiutil.gettime or nil
+    if gt then
+        local tok, t = pcall(gt)
+        if tok and type(t) == "number" then return t end
+    end
+    return os.time()
+end
+
 --- 转义 JS 字符串字面量（与 jshost.jsStringEscape 同规则）
 local function jesc(s)
     return (tostring(s):gsub("\\", "\\\\"):gsub('"', '\\"')
@@ -148,8 +161,13 @@ local AWAIT_SNIPPET = [[
     try { return JSON.stringify(ser(x, 0)); }
     catch (e) { return '{"__error":"serialize: " + String(e)}'; }
   };
-  globalThis.__ezv_ret = undefined;
-  const out = (j) => { globalThis.__ezv_ret = j; };
+  // r10 M3：一次 await 占一个单调递增的槽，结果写进**自己**那一格。旧实现是
+  // 单槽全局：超时放弃后源的迟到兑现会写进全局，正好踩掉下一次 await 正在等
+  // 的结果（张冠李戴，且极难复现）。槽位化之后并发 await 互不干扰，迟到只
+  // 会填一个已经没人读的格子。
+  globalThis.__ezv_ret = globalThis.__ezv_ret || {};
+  const slot = (globalThis.__ezv_seq = (globalThis.__ezv_seq || 0) + 1);
+  const out = (j) => { globalThis.__ezv_ret[slot] = j; return slot; };
   const s = ComicSource.sources["%s"];
   if (!s) return out(enc({ __error: "source not installed" }));
   const f = %s;
@@ -176,9 +194,9 @@ local AWAIT_SNIPPET = [[
     out('{"__pending":true}');
     r.then((v) => out(enc({ value: v })),
            (e) => out(enc({ __error: errStr(e) })));
-  } else {
-    out(enc({ value: r === undefined ? null : r }));
+    return slot;                 // Lua 侧靠这个编号轮询自己那一格
   }
+  return out(enc({ value: r === undefined ? null : r }));
 })()
 ]]
 
@@ -239,44 +257,164 @@ end
 --- 就是整批源打不开，且错在 JS 侧、Lua 侧看不见。
 Browser.memberChain = memberChain
 
---- 调用源方法/属性并取回结果（同步值、async promise 统一处理）。
---- path 形如 "category" / "search.load" / "comic.loadInfo" / "explore.0.load"。
---- argsJson 为 JSON 数组字面量（可 nil）。返回 (value|nil, err)
-function Browser:_awaitSource(key, path, argsJson)
+--- 拼 await 代码并交给引擎。引擎在 eval 内部同步泵一次，所以返回时槽里要么
+--- 已经是终值（源方法是同步的 / 桥没开异步），要么写着 `__pending`。
+--- 返回 (slot|nil, err)。slot 是这次 await 独占的格子编号。
+function Browser:_startAwait(key, path, argsJson)
     local jsKey, lerr = self:_ensureSourceLoaded(key)
     if not jsKey then return nil, lerr end
-    local chain = memberChain(path)
-    local code = AWAIT_SNIPPET:format(jesc(jsKey), chain,
+    local code = AWAIT_SNIPPET:format(jesc(jsKey), memberChain(path),
         argsJson or "[]", path)
     -- engine:eval 内部：JS_Eval → 同步泵排空微任务（promise 兑现）
-    local ok, err = self.engine:eval(code)
-    if not ok then return nil, tostring(err) end
-    local ok2, res = self.engine:eval("globalThis.__ezv_ret")
-    if not ok2 then return nil, tostring(res) end
-    if res == nil or res == "undefined" then
-        return nil, "no result"
+    local ok, res = self.engine:eval(code)
+    if not ok then return nil, tostring(res) end
+    -- IIFE 返回槽号；拿不到数字就说明 snippet 被改坏了（宁可报错也别去读
+    -- 别人的格子——那是 r10 M3 槽位化要消灭的那类张冠李戴）
+    local slot = tonumber(res)
+    if not slot then return nil, "no result" end
+    return slot
+end
+
+--- JSON 解码入口：真机用 KOReader 的 C 模块；单测注入 `b.json` 就优先用它
+--- （本地测试 VM 里根本没有 json，拿全局桩替换会污染同一进程里后续的文件）。
+--- 返回 (value|nil, err)。
+function Browser:_jsonDecode(s)
+    local J = self.json
+    if not J then
+        local okj, M = pcall(require, "json")
+        if not okj or not M then return nil, "json module unavailable" end
+        J = M
     end
-    local okj, J = pcall(require, "json")
-    if not okj or not J then return nil, "json module unavailable" end
-    local okd, v = pcall(function() return J.decode(res) end)
-    if not okd then
+    local okd, v = pcall(function() return J.decode(s) end)
+    if not okd then return nil, "bad JSON: " .. tostring(v) end
+    return v
+end
+
+--- 读一个槽的当前结果。返回 (kind, value, err)，kind = "pending"|"ok"|"err"。
+--- 同步与异步**共用**这段判定：异步绝不能改变源的形状语义——`__error` 是源
+--- 自己抛的错、`value` 可以是合法的 nil，两者都不许被当成「还没好」。
+--- "pending" 时 err 带的是同步形态该报的那句话（保持既有文案与单测契约）。
+function Browser:_slotResult(slot, key, path)
+    local ok, res = self.engine:eval(
+        "globalThis.__ezv_ret[" .. tostring(slot) .. "]")
+    if not ok then return "err", nil, tostring(res) end
+    if res == nil or res == "undefined" then
+        return "pending", nil, "no result"
+    end
+    local v, derr = self:_jsonDecode(res)
+    if not v then
         logger.warn("ezvenera source bad JSON:", key, path,
             tostring(res):sub(1, 200))
-        return nil, "bad JSON: " .. tostring(res)
+        return "err", nil, derr
     end
-    if type(v) ~= "table" then return nil, "bad result shape" end
+    if type(v) ~= "table" then return "err", nil, "bad result shape" end
     if v.__pending then
-        return nil, "异步任务未兑现（源内 promise 悬挂或泵上限截断）"
+        return "pending", nil, "异步任务未兑现（源内 promise 悬挂或泵上限截断）"
     end
     if v.__error then
         -- 源抛出的原文（含 errStr 带来的 JS 栈）必须落 logcat：弹窗只截前
         -- 若干字符，而"加载失败"这类无信息文案背后是 URL/状态码问题
         logger.warn("ezvenera source error:", key, path,
             tostring(v.__error):sub(1, 300))
-        return nil, tostring(v.__error)
+        return "err", nil, tostring(v.__error)
     end
-    return v.value
+    return "ok", v.value
 end
+
+--- 用完即删：不删的话 JS 侧那张表只增不减（每拍 eval 一次就要几十字节，
+--- 几百次浏览之后是几百 KB 的常驻垃圾）
+function Browser:_clearSlot(slot)
+    pcall(function()
+        self.engine:eval("delete globalThis.__ezv_ret["
+            .. tostring(slot) .. "]")
+    end)
+end
+
+--- 跨拍等待可用吗？只有桥真的开了 async_http 且环境有调度器才走跨拍；其余
+--- （开关关闭、单测、无 UIManager 的桩）一律退回同步 API。这条判据同时保证
+--- 「开关关闭时行为与今天逐字节一致」。
+function Browser:_asyncAwaitReady()
+    local eng = self.engine
+    if not (eng and eng.bridge and eng.bridge.async_http) then return false end
+    return type(UIManager) == "table"
+        and type(UIManager.scheduleIn) == "function"
+end
+
+--- 调用源方法/属性并取回结果（同步值、async promise 统一处理）。
+--- path 形如 "category" / "search.load" / "comic.loadInfo" / "explore.0.load"。
+--- argsJson 为 JSON 数组字面量（可 nil）。返回 (value|nil, err)
+--- 【r10 M3】网络型源方法请优先用 `_awaitSourceAsync`；这里保留同步形态，
+--- 未兑现时按原样报「异步任务未兑现」。
+function Browser:_awaitSource(key, path, argsJson)
+    local slot, serr = self:_startAwait(key, path, argsJson)
+    if not slot then return nil, serr end
+    local kind, value, err = self:_slotResult(slot, key, path)
+    self:_clearSlot(slot)
+    if kind == "ok" then return value end
+    return nil, err
+end
+
+--- 同 `_awaitSource`，但结果**只经 on_done(value, err)**，未就绪时跨节拍等。
+--- 同步就绪（声明属性、桥未开异步）时 on_done 在同一个调用栈帧里就跑完，所以
+--- 所有调用点在今天默认配置下与 `_awaitSource` 逐字节等价——「异步」只在桥
+--- 当拍真没给出结果时才发生。
+function Browser:_awaitSourceAsync(key, path, argsJson, on_done)
+    if not self:_asyncAwaitReady() then
+        on_done(self:_awaitSource(key, path, argsJson))
+        return
+    end
+    local slot, serr = self:_startAwait(key, path, argsJson)
+    if not slot then on_done(nil, serr) return end
+    local function finish(value, err)
+        self:_clearSlot(slot)
+        -- 续体里全是建菜单的 Lua 代码：错误冒到 KOReader 主循环就是整应用闪退
+        self:_guard(path, function() on_done(value, err) end)
+    end
+    local kind, value, err = self:_slotResult(slot, key, path)
+    if kind == "ok" then finish(value) return end
+    if kind == "err" then finish(nil, err) return end
+
+    local deadline = nowSec() + self.AWAIT_TIMEOUT_SEC
+    local function step()
+        -- 引擎/开关在半路没了（泵死掉、源被重装）：别再等，当场说清楚
+        local eng = self.engine
+        if not (eng and eng.bridge and eng.bridge.async_http) then
+            finish(nil, "引擎已停止，等待中断")
+            return
+        end
+        -- 一拍一次泵：_tickNet → 投递 → 微任务 → 定时器，顺序在 jshost 钉着
+        pcall(function() eng:pump() end)
+        local k, v, e = self:_slotResult(slot, key, path)
+        if k == "ok" then finish(v) return end
+        if k == "err" then finish(nil, e) return end
+        if nowSec() >= deadline then
+            -- 网络失败由桥按**值**投回（status=nil + error），到不了这里；
+            -- 走到超时说明是泵停摆 / 源内 promise 永挂这类不会再有人兑现的情况
+            logger.warn("ezvenera await timeout:", key, path,
+                tostring(self.AWAIT_TIMEOUT_SEC) .. "s")
+            finish(nil, _("等待源响应超时（%d 秒）：该源可能太慢或已失效")
+                :format(self.AWAIT_TIMEOUT_SEC))
+            return
+        end
+        local ok = pcall(function()
+            UIManager:scheduleIn(self.AWAIT_SLICE_SEC, step)
+        end)
+        if not ok then finish(nil, e) end
+    end
+    local ok = pcall(function()
+        UIManager:scheduleIn(self.AWAIT_SLICE_SEC, step)
+    end)
+    if not ok then
+        self:_clearSlot(slot)
+        on_done(nil, "无法排入节拍，异步等待中止")
+    end
+end
+
+-- 0.05s = 与主泵忙时周期同值：M0 实测「一次挂起→唤醒」的成本恰好一个泵周期，
+-- 排得更密只是多烧 eval。
+Browser.AWAIT_SLICE_SEC = 0.05
+-- 上限只兜「泵死掉 / 源内 promise 永挂」；真网络的慢由 netclient 自己的超时管
+Browser.AWAIT_TIMEOUT_SEC = 60
 
 --- 探测源成员是否存在（可选方法如 comic.onImageLoad）
 function Browser:_hasMember(key, path)
@@ -409,9 +547,10 @@ end
 function Browser:_openCategoryItem(item)
     local key = item.key
     if item.is_search_item then
-        local options = self:_defaultOptions(key, "search", "search")
-        self:showResults(key, "search.load",
-            { item.category, options }, 1, _("搜索: ") .. item.category)
+        self:_defaultOptions(key, "search", "search", function(options)
+            self:showResults(key, "search.load",
+                { item.category, options }, 1, _("搜索: ") .. item.category)
+        end)
         return
     end
     self:showCategory(key, item)
@@ -496,59 +635,64 @@ function Browser:showSourceHome(key)
             callback = function() self:showSearch(key) end,
         },
     }
-    local n_cat, readErr = 0, nil
-    local decl, err = self:_awaitSource(key, "category")
-    if type(decl) == "table" then
-        local parts = (type(decl.parts) == "table" and decl.parts)
-            or (type(decl.categories) == "table"
-                and { { categories = decl.categories,
-                        categoryParams = decl.categoryParams,
-                        itemType = decl.itemType } }
-                or nil)
-        for _, part in ipairs(parts or {}) do
-            if type(part) == "table" and type(part.categories) == "table"
-                    and #part.categories > 0 then
-                local params = part.categoryParams or {}
-                if part.name and part.name ~= "" then
-                    table.insert(item_table, {
-                        text = tostring(part.name), info_only = true,
-                    })
-                end
-                for i, cat in ipairs(part.categories) do
-                    local label, category, param = tostring(cat), nil, params[i]
-                    if type(cat) == "table" then
-                        -- 【2026-09-24 移植包 v1.0.1】Venera 契约的 categories 是
-                        -- 字符串数组（+平行 categoryParams），但自动移植流水线产出
-                        -- `{label, target:{page, attributes:{category, param}}}`。
-                        -- 不吃这一形状的话 `tostring(cat)` 会渲染成 "table: 0x…"，
-                        -- 而 param 取不到 → 源里 URL 退化成 baseUrl（点了没内容）。
-                        label = cat.label or cat.name or cat.title or ""
-                        local at = (type(cat.target) == "table")
-                            and cat.target.attributes or nil
-                        if type(at) == "table" then
-                            category = at.category
-                            param = at.param
-                        end
-                        category = category or cat.category or label
-                        param = param or cat.param or cat.value or params[i]
+    local n_cat, n_exp, readErr = 0, 0, nil
+    -- r10 M3：两条声明各自 await，然后**一次**建菜单。静态声明走同步快路（同一个
+    -- 栈帧里跑完，与今天逐字节一致）；只有源把 category/explore 写成异步取值时
+    -- 才晚一拍——菜单不能建两遍，所以 explore 排在 category 的续体里。
+    local function takeCategory(decl, err)
+        if type(decl) == "table" then
+            local parts = (type(decl.parts) == "table" and decl.parts)
+                or (type(decl.categories) == "table"
+                    and { { categories = decl.categories,
+                            categoryParams = decl.categoryParams,
+                            itemType = decl.itemType } }
+                    or nil)
+            for _, part in ipairs(parts or {}) do
+                if type(part) == "table" and type(part.categories) == "table"
+                        and #part.categories > 0 then
+                    local params = part.categoryParams or {}
+                    if part.name and part.name ~= "" then
+                        table.insert(item_table, {
+                            text = tostring(part.name), info_only = true,
+                        })
                     end
-                    label = tostring(label)
-                    n_cat = n_cat + 1
-                    table.insert(item_table, {
-                        text = label,
-                        category = tostring(category or label),
-                        param = param,
-                        -- itemType=="search" 的分类项当关键词搜；否则走分类
-                        is_search_item = part.itemType == "search",
-                        key = key,
-                    })
+                    for i, cat in ipairs(part.categories) do
+                        local label, category, param = tostring(cat), nil, params[i]
+                        if type(cat) == "table" then
+                            -- 【2026-09-24 移植包 v1.0.1】Venera 契约的 categories 是
+                            -- 字符串数组（+平行 categoryParams），但自动移植流水线产出
+                            -- `{label, target:{page, attributes:{category, param}}}`。
+                            -- 不吃这一形状的话 `tostring(cat)` 会渲染成 "table: 0x…"，
+                            -- 而 param 取不到 → 源里 URL 退化成 baseUrl（点了没内容）。
+                            label = cat.label or cat.name or cat.title or ""
+                            local at = (type(cat.target) == "table")
+                                and cat.target.attributes or nil
+                            if type(at) == "table" then
+                                category = at.category
+                                param = at.param
+                            end
+                            category = category or cat.category or label
+                            param = param or cat.param or cat.value or params[i]
+                        end
+                        label = tostring(label)
+                        n_cat = n_cat + 1
+                        table.insert(item_table, {
+                            text = label,
+                            category = tostring(category or label),
+                            param = param,
+                            -- itemType=="search" 的分类项当关键词搜；否则走分类
+                            is_search_item = part.itemType == "search",
+                            key = key,
+                        })
+                    end
                 end
             end
+        elseif err and err:find("missing", 1, true) == nil then
+            -- category 存在但读取失败才提示（missing 只是该源无分类声明）
+            readErr = _("分类声明读取失败：") .. tostring(err)
         end
-    elseif err and err:find("missing", 1, true) == nil then
-        -- category 存在但读取失败才提示（missing 只是该源无分类声明）
-        readErr = _("分类声明读取失败：") .. tostring(err)
     end
+
     -- ---------- 发现（explore） ----------
     -- 【2026-09-24 移植包两代实测】v1.0.0 的 31 个移植源**全部**只有 explore、
     -- 没有 category（logcat: `czmanga category missing category`）；重新生成的
@@ -560,43 +704,53 @@ function Browser:showSourceHome(key)
     --   singlePageWithMultiPart load()    → { 分区名 = [ Comic ] }（copy_manga）
     --   pageCol                load(page) → { title, pages = [...] }
     --   subExplores            无 load，带子项数组（再点一层）
-    local ex, exErr = self:_awaitSource(key, "explore")
-    local n_exp = 0
-    if type(ex) == "table" then
-        for _, it in ipairs(exploreItems(ex, "explore", key)) do
-            n_exp = n_exp + 1
-            table.insert(item_table, it)
+    local function takeExplore(ex, exErr)
+        if type(ex) == "table" then
+            for _, it in ipairs(exploreItems(ex, "explore", key)) do
+                n_exp = n_exp + 1
+                table.insert(item_table, it)
+            end
+        elseif exErr and exErr:find("missing", 1, true) == nil then
+            readErr = readErr or (_("发现内容读取失败：") .. tostring(exErr))
         end
-    elseif exErr and exErr:find("missing", 1, true) == nil then
-        readErr = readErr or (_("发现内容读取失败：") .. tostring(exErr))
     end
-    if readErr then self.infoMessage(readErr) end
-    if n_cat == 0 and n_exp == 0 then
-        -- 什么都没声明：明说，别让菜单看起来像加载坏了
-        table.insert(item_table, {
-            text = _("（该源未声明分类/发现项，只能用搜索）"),
-            info_only = true,
-        })
+
+    local function buildHome()
+        if readErr then self.infoMessage(readErr) end
+        if n_cat == 0 and n_exp == 0 then
+            -- 什么都没声明：明说，别让菜单看起来像加载坏了
+            table.insert(item_table, {
+                text = _("（该源未声明分类/发现项，只能用搜索）"),
+                info_only = true,
+            })
+        end
+        local menu = self:_navMenu{
+            title = self:_crumbTitle(key),
+            item_table = item_table,
+            onMenuSelect = function(menu_self, item)
+                -- 分组标题行（info_only）没有对应内容：真机上点「主题」这类灰行
+                -- 会先关掉整个菜单再什么也不做，用户以为源坏了。灰行直接忽略。
+                if item.info_only then return end
+                self:_guard(_("分类"), function()
+                    if item.callback then
+                        item.callback()
+                    elseif item.explore_path or item.explore_sub then
+                        self:_openExploreItem(key, item)
+                    elseif item.is_search_item or item.category then
+                        self:_openCategoryItem(item)
+                    end
+                end)
+            end,
+        }
+        UIManager:show(menu)
     end
-    local menu = self:_navMenu{
-        title = self:_crumbTitle(key),
-        item_table = item_table,
-        onMenuSelect = function(menu_self, item)
-            -- 分组标题行（info_only）没有对应内容：真机上点「主题」这类灰行
-            -- 会先关掉整个菜单再什么也不做，用户以为源坏了。灰行直接忽略。
-            if item.info_only then return end
-            self:_guard(_("分类"), function()
-                if item.callback then
-                    item.callback()
-                elseif item.explore_path or item.explore_sub then
-                    self:_openExploreItem(key, item)
-                elseif item.is_search_item or item.category then
-                    self:_openCategoryItem(item)
-                end
-            end)
-        end,
-    }
-    UIManager:show(menu)
+    self:_awaitSourceAsync(key, "category", nil, function(decl, err)
+        takeCategory(decl, err)
+        self:_awaitSourceAsync(key, "explore", nil, function(ex, exErr)
+            takeExplore(ex, exErr)
+            buildHome()
+        end)
+    end)
 end
 
 --- 发现项被点：子项组开子菜单，其余交给 _openExplore
@@ -610,26 +764,29 @@ end
 
 --- 二级发现（subExplores）：同一套菜单渲染，路径前缀带上下标
 function Browser:_showExploreSub(key, path, title)
-    local list, err = self:_awaitSource(key, path, "[]")
-    if not list then
-        self.infoMessage(_("子项读取失败：") .. tostring(err))
-        return
-    end
-    local items = exploreItems(list, path, key)
-    if #items == 0 then
-        self.infoMessage(_("该发现项没有内容"))
-        return
-    end
-    local menu = self:_navMenu{
-        title = self:_crumbTitle(key, title or key),
-        item_table = items,
-        onMenuSelect = function(menu_self, item)
-            self:_guard(_("发现"), function()
-                self:_openExploreItem(key, item)
-            end)
-        end,
-    }
-    UIManager:show(menu)
+    -- r10 M3：整段结果处理搬进续体。同步就绪（今天的默认）时同帧跑完，
+    -- 用户看不出差别；桥开异步后当拍没结果，才晚一拍出菜单。
+    self:_awaitSourceAsync(key, path, "[]", function(list, err)
+        if not list then
+            self.infoMessage(_("子项读取失败：") .. tostring(err))
+            return
+        end
+        local items = exploreItems(list, path, key)
+        if #items == 0 then
+            self.infoMessage(_("该发现项没有内容"))
+            return
+        end
+        local menu = self:_navMenu{
+            title = self:_crumbTitle(key, title or key),
+            item_table = items,
+            onMenuSelect = function(menu_self, item)
+                self:_guard(_("发现"), function()
+                    self:_openExploreItem(key, item)
+                end)
+            end,
+        }
+        UIManager:show(menu)
+    end)
 end
 
 --- 打开一个发现项。分页/单页列表直接复用 showResults（下一页、进详情现成）；
@@ -640,40 +797,42 @@ function Browser:_openExplore(key, item)
         self:showResults(key, item.explore_path, {}, 1, item.text)
         return
     end
-    local data, err = self:_awaitSource(key, item.explore_path, "[]")
-    if type(data) ~= "table" then
-        self.infoMessage(_("加载失败：") .. tostring(err)
-            .. loginHint(err) .. errHint(err))
-        return
-    end
-    local parts = exploreParts(data)
-    if #parts == 0 then
-        self.infoMessage(_("无结果"))
-        return
-    end
-    if #parts == 1 then
-        self:showComicArrayMenu(item.text, key, parts[1].comics)
-        return
-    end
-    local item_table = {}
-    for _, p in ipairs(parts) do
-        table.insert(item_table, {
-            text = p.title,
-            mandatory = ("%d"):format(#p.comics),
-            part = p,
-        })
-    end
-    local menu = self:_navMenu{
-        title = self:_crumbTitle(key, item.text),
-        item_table = item_table,
-        onMenuSelect = function(menu_self, it)
-            self:_guard(_("发现"), function()
-                self:showComicArrayMenu(it.part.title .. " · " .. item.text,
-                    key, it.part.comics)
-            end)
-        end,
-    }
-    UIManager:show(menu)
+    self:_awaitSourceAsync(key, item.explore_path, "[]",
+        function(data, err)
+        if type(data) ~= "table" then
+            self.infoMessage(_("加载失败：") .. tostring(err)
+                .. loginHint(err) .. errHint(err))
+            return
+        end
+        local parts = exploreParts(data)
+        if #parts == 0 then
+            self.infoMessage(_("无结果"))
+            return
+        end
+        if #parts == 1 then
+            self:showComicArrayMenu(item.text, key, parts[1].comics)
+            return
+        end
+        local item_table = {}
+        for _, p in ipairs(parts) do
+            table.insert(item_table, {
+                text = p.title,
+                mandatory = ("%d"):format(#p.comics),
+                part = p,
+            })
+        end
+        local menu = self:_navMenu{
+            title = self:_crumbTitle(key, item.text),
+            item_table = item_table,
+            onMenuSelect = function(menu_self, it)
+                self:_guard(_("发现"), function()
+                    self:showComicArrayMenu(it.part.title .. " · " .. item.text,
+                        key, it.part.comics)
+                end)
+            end,
+        }
+        UIManager:show(menu)
+    end)
 end
 
 --- 静态漫画数组 → 列表菜单（分区型发现用；无分页，点击直接进详情）
@@ -755,15 +914,23 @@ end
 --- （copy_manga.js:626/633、zaimanhua.js:224），而 optionList 按 showWhen
 --- 分组。排行榜不过滤 → 传进去的是「分类组」的默认值，rank 参数直接
 --- 错位（zaimanhua.js:210 更把整个数组拼进 URL）。
-function Browser:_defaultOptions(key, methodPath, ctx)
-    local ol = self:_awaitSource(key, methodPath .. ".optionList")
-    local out = {}
-    if type(ol) ~= "table" then return out end
-    for _, group in ipairs(ol) do
-        local v = optionGroupValue(group, ctx or "")
-        if v ~= nil then table.insert(out, v) end
+function Browser:_defaultOptions(key, methodPath, ctx, on_done)
+    local function picked(ol)
+        local out = {}
+        if type(ol) ~= "table" then return out end
+        for _, group in ipairs(ol) do
+            local v = optionGroupValue(group, ctx or "")
+            if v ~= nil then table.insert(out, v) end
+        end
+        return out
     end
-    return out
+    -- 无 on_done = 同步形态（单测与「optionList 是静态声明」的源都走这条，
+    -- 与今天逐字节一致）
+    if not on_done then
+        return picked(self:_awaitSource(key, methodPath .. ".optionList"))
+    end
+    self:_awaitSourceAsync(key, methodPath .. ".optionList", nil,
+        function(ol) on_done(picked(ol)) end)
 end
 
 -- ---------- 层级 3a：搜索 ----------
@@ -772,48 +939,52 @@ end
 
 function Browser:showSearch(key)
     local InputDialog = require("ui/widget/inputdialog")
-    local options = self:_defaultOptions(key, "search", "search")
-    local dialog
-    local function runSearch(kw)
-        if not kw or kw == "" then return end
-        UIManager:close(dialog)
-        self:showResults(key, "search.load", { kw, options }, 1,
-            _("搜索: ") .. kw)
-    end
-    dialog = InputDialog:new{
-        title = _("搜索漫画"),
-        input = "",
-        buttons = {
-            {
+    -- optionList 是静态声明时 on_done 同帧就跑完（对话框照常立刻弹出）；只有源
+    -- 把它写成异步取值的形态，才会晚一拍——晚一拍也必须先把键盘交给用户。
+    self:_defaultOptions(key, "search", "search", function(options)
+        local dialog
+        local function runSearch(kw)
+            if not kw or kw == "" then return end
+            UIManager:close(dialog)
+            self:showResults(key, "search.load", { kw, options }, 1,
+                _("搜索: ") .. kw)
+        end
+        dialog = InputDialog:new{
+            title = _("搜索漫画"),
+            input = "",
+            buttons = {
                 {
-                    text = _("取消"),
-                    callback = function() UIManager:close(dialog) end,
+                    {
+                        text = _("取消"),
+                        callback = function() UIManager:close(dialog) end,
+                    },
+                },
+                {
+                    {
+                        text = _("搜索"),
+                        is_enter_default = true,
+                        callback = function()
+                            self:_guard(_("搜索"), function()
+                                runSearch(dialog:getInputText())
+                            end)
+                        end,
+                    },
                 },
             },
-            {
-                {
-                    text = _("搜索"),
-                    is_enter_default = true,
-                    callback = function()
-                        self:_guard(_("搜索"), function()
-                            runSearch(dialog:getInputText())
-                        end)
-                    end,
-                },
-            },
-        },
-    }
-    UIManager:show(dialog)
-    dialog:onShowKeyboard()
+        }
+        UIManager:show(dialog)
+        dialog:onShowKeyboard()
+    end)
 end
 
 -- ---------- 层级 3b：分类（含 options） ----------
 
 function Browser:showCategory(key, item)
     -- categoryComics.load(category, param, options, page)
-    local options = self:_defaultOptions(key, "categoryComics", item.category)
-    self:showResults(key, "categoryComics.load",
-        { item.category, item.param or "", options }, 1, item.text)
+    self:_defaultOptions(key, "categoryComics", item.category, function(options)
+        self:showResults(key, "categoryComics.load",
+            { item.category, item.param or "", options }, 1, item.text)
+    end)
 end
 
 --- 【R9 真机闪退收口】凡由菜单回调、widget 回调、scheduleIn 回调或 metamethod
@@ -868,60 +1039,64 @@ function Browser:showResults(key, methodPath, argsTable, page, title)
         table.insert(parts, s)
     end
     table.insert(parts, tostring(page or 1))
-    local res, err = self:_awaitSource(key, methodPath,
-        "[" .. table.concat(parts, ",") .. "]")
-    if not res then
-        self.infoMessage(_("加载失败：") .. tostring(err) .. loginHint(err) .. errHint(err))
-        return
-    end
-    if type(res) ~= "table" then
-        -- 源返回 null / 字符串：直接 res.comics 取值会在 lightuserdata 上
-        -- 索引而崩（KOReader 主循环里的 Lua error = 整应用闪退）
-        self.infoMessage(_("该源返回了空数据（type=") .. type(res) .. "）")
-        return
-    end
-    local comics = res.comics
-    if type(comics) ~= "table" then
-        -- explore 的 comicList / 部分源直接返回数组本身，没有 {comics=…} 包装
-        comics = (#res > 0) and res or {}
-    end
-    local maxPage = tonumber(res.maxPage) or page or 1
-    if #comics == 0 then
-        self.infoMessage(_("无结果"))
-        return
-    end
-    local item_table = {}
-    for _, c in ipairs(comics) do
-        table.insert(item_table, {
-            text = c.title or c.id,
-            mandatory = (c.stars and tostring(c.stars)) or nil,
-            comic = c,
-        })
-    end
-    if maxPage > (page or 1) then
-        table.insert(item_table, {
-            text = _("▶ 下一页"),
-            nextPage = true,
-        })
-    end
-    local menu = self:_navMenu{
-        title = self:_crumbTitle(key, (title or key)
-            .. (" · %d/%s"):format(page or 1, tostring(maxPage))),
-        item_table = item_table,
-        onMenuSelect = function(menu_self, item)
-            self:_guard(_("结果列表"), function()
-                if item.nextPage then
-                    -- 盖栈：下一页压在本页之上，返回箭头回到上一页（历史语义）
-                    self:showResults(key, methodPath, argsTable,
-                        (page or 1) + 1, title)
-                elseif item.comic then
-                    -- 盖栈：详情压在结果页之上，返回箭头回到本页
-                    self:showDetail(key, item.comic)
-                end
-            end)
-        end,
-    }
-    UIManager:show(menu)
+    -- r10 M3：结果处理整段进续体。调用方（下一页、进详情）都不取返回值，
+    -- 所以签名保持不变，跨拍只影响「菜单何时出现」。
+    self:_awaitSourceAsync(key, methodPath,
+        "[" .. table.concat(parts, ",") .. "]", function(res, err)
+        if not res then
+            self.infoMessage(_("加载失败：") .. tostring(err)
+                .. loginHint(err) .. errHint(err))
+            return
+        end
+        if type(res) ~= "table" then
+            -- 源返回 null / 字符串：直接 res.comics 取值会在 lightuserdata 上
+            -- 索引而崩（KOReader 主循环里的 Lua error = 整应用闪退）
+            self.infoMessage(_("该源返回了空数据（type=") .. type(res) .. "）")
+            return
+        end
+        local comics = res.comics
+        if type(comics) ~= "table" then
+            -- explore 的 comicList / 部分源直接返回数组本身，没有 {comics=…} 包装
+            comics = (#res > 0) and res or {}
+        end
+        local maxPage = tonumber(res.maxPage) or page or 1
+        if #comics == 0 then
+            self.infoMessage(_("无结果"))
+            return
+        end
+        local item_table = {}
+        for _, c in ipairs(comics) do
+            table.insert(item_table, {
+                text = c.title or c.id,
+                mandatory = (c.stars and tostring(c.stars)) or nil,
+                comic = c,
+            })
+        end
+        if maxPage > (page or 1) then
+            table.insert(item_table, {
+                text = _("▶ 下一页"),
+                nextPage = true,
+            })
+        end
+        local menu = self:_navMenu{
+            title = self:_crumbTitle(key, (title or key)
+                .. (" · %d/%s"):format(page or 1, tostring(maxPage))),
+            item_table = item_table,
+            onMenuSelect = function(menu_self, item)
+                self:_guard(_("结果列表"), function()
+                    if item.nextPage then
+                        -- 盖栈：下一页压在本页之上，返回箭头回到上一页（历史语义）
+                        self:showResults(key, methodPath, argsTable,
+                            (page or 1) + 1, title)
+                    elseif item.comic then
+                        -- 盖栈：详情压在结果页之上，返回箭头回到本页
+                        self:showDetail(key, item.comic)
+                    end
+                end)
+            end,
+        }
+        UIManager:show(menu)
+    end)
 end
 
 -- ---------- 层级 5：详情（章节列表） ----------
@@ -991,97 +1166,103 @@ function Browser:_cacheChapters(key, comicId, rows)
 end
 
 --- 取一本书的章节表（阅读器侧：没进过详情才会真发源调用）。
-function Browser:_chapterList(key, comicId)
+--- r10 M3：缓存命中或同步就绪时 on_done 同帧跑完，否则跨拍等——所以结果只经
+--- on_done(rows, err)，不再返回值。
+function Browser:_chapterListAsync(key, comicId, on_done)
     local ck = key .. "\1" .. tostring(comicId)
     local hit = self._chapter_cache and self._chapter_cache[ck]
-    if hit then return hit end
-    local res, err = self:_awaitSource(key, "comic.loadInfo",
-        '[' .. '"' .. jesc(comicId) .. '"' .. ']')
-    if not res then
-        return nil, _("章节列表加载失败：") .. tostring(err) .. loginHint(err)
-    end
-    return self:_cacheChapters(key, comicId, flattenChapters(res.chapters))
+    if hit then on_done(hit) return end
+    self:_awaitSourceAsync(key, "comic.loadInfo",
+        '[' .. '"' .. jesc(comicId) .. '"' .. ']', function(res, err)
+        if not res then
+            on_done(nil, _("章节列表加载失败：") .. tostring(err)
+                .. loginHint(err))
+            return
+        end
+        on_done(self:_cacheChapters(key, comicId, flattenChapters(res.chapters)))
+    end)
 end
 
 function Browser:showDetail(key, comic)
     self:progressMessage(_("加载详情…"))
-    local res, err = self:_awaitSource(key, "comic.loadInfo",
-        '[' .. '"' .. jesc(comic.id) .. '"' .. ']')
-    if not res then
-        self.infoMessage(_("详情加载失败：") .. tostring(err) .. loginHint(err) .. errHint(err))
-        return
-    end
-    local details = res
-    local bookTitle = details.title or comic.title
-    if self.library then
-        -- 打开详情即算一条阅读记录；章节由 showReader 覆盖进同一条
-        self.library:recordRead({ key = key, comicId = comic.id,
-            title = bookTitle })
-    end
-    local item_table = {}
-    -- 章节：扁平 {id:title} 或分组 {group:{id:title}}；排序规则收敛在
-    -- flattenChapters，详情 / 下载清单 / 阅读器切章共用同一份
-    local chapters = flattenChapters(details.chapters)
-    self:_cacheChapters(key, comic.id, chapters)
-    if details.title then
-        table.insert(item_table, {
-            text = _("◆ ") .. (details.title or comic.title),
-            info_only = true,
-        })
-    end
-    local chapter_rows = {}   -- 详情已取到的章节表，离线下载清单直接复用
-    for _, ch in ipairs(chapters) do
-        table.insert(item_table, {
-            text = ch.title,
-            mandatory = tostring(ch.epId),
-            comicId = comic.id,
-            epId = ch.epId,
-        })
-        table.insert(chapter_rows, { comicId = comic.id, epId = ch.epId,
-            title = ch.title })
-    end
-    if #chapter_rows > 0 then
-        -- 收藏插到 1 位时会把它挤到第 2 行：顶部两行固定是「收藏 / 下载」
-        table.insert(item_table, 1, {
-            text = _("下载章节（离线阅读）"),
-            downloadMgr = true,
-        })
-    end
-    if self.library then
-        local isFav = self.library:isFavorite(key, comic.id)
-        table.insert(item_table, 1, {
-            text = isFav and _("★ 已收藏（点击取消）") or _("☆ 收藏本书"),
-            favToggle = true,
-        })
-    end
-    local menu = self:_navMenu{
-        title = self:_crumbTitle(key, bookTitle or key),
-        item_table = item_table,
-        onMenuSelect = function(menu_self, item)
-            self:_guard(_("章节"), function()
-                if item.favToggle then
-                    local now = self.library:toggleFavorite({
-                        key = key, comicId = comic.id, title = bookTitle,
-                    })
-                    -- 不重建菜单（重建要重取详情=又一次网络请求）；用自消失
-                    -- 提示确认结果，标签在下次进入时刷新。
-                    item.text = now and _("★ 已收藏（点击取消）")
-                        or _("☆ 收藏本书")
-                    self:progressMessage(now and _("已加入收藏夹")
-                        or _("已取消收藏"))
-                elseif item.downloadMgr then
-                    self:showChapterDownloads(key, bookTitle, chapter_rows)
-                elseif item.epId then
-                    -- 【返回】章节菜单不关：阅读器盖在其上，关掉阅读器即回到
-                    -- 章节列表。此前先 close 再开阅读器，栈被拆掉，用户只剩
-                    -- 【关闭】一个出口（真机反馈"无返回按钮"）。
-                    self:showReader(key, item.comicId, item.epId,
-                        bookTitle, item.text)
-                end
-            end)
-        end,
-    }
-    UIManager:show(menu)
+    self:_awaitSourceAsync(key, "comic.loadInfo",
+        '[' .. '"' .. jesc(comic.id) .. '"' .. ']', function(res, err)
+        if not res then
+            self.infoMessage(_("详情加载失败：") .. tostring(err) .. loginHint(err) .. errHint(err))
+            return
+        end
+        local details = res
+        local bookTitle = details.title or comic.title
+        if self.library then
+            -- 打开详情即算一条阅读记录；章节由 showReader 覆盖进同一条
+            self.library:recordRead({ key = key, comicId = comic.id,
+                title = bookTitle })
+        end
+        local item_table = {}
+        -- 章节：扁平 {id:title} 或分组 {group:{id:title}}；排序规则收敛在
+        -- flattenChapters，详情 / 下载清单 / 阅读器切章共用同一份
+        local chapters = flattenChapters(details.chapters)
+        self:_cacheChapters(key, comic.id, chapters)
+        if details.title then
+            table.insert(item_table, {
+                text = _("◆ ") .. (details.title or comic.title),
+                info_only = true,
+            })
+        end
+        local chapter_rows = {}   -- 详情已取到的章节表，离线下载清单直接复用
+        for _, ch in ipairs(chapters) do
+            table.insert(item_table, {
+                text = ch.title,
+                mandatory = tostring(ch.epId),
+                comicId = comic.id,
+                epId = ch.epId,
+            })
+            table.insert(chapter_rows, { comicId = comic.id, epId = ch.epId,
+                title = ch.title })
+        end
+        if #chapter_rows > 0 then
+            -- 收藏插到 1 位时会把它挤到第 2 行：顶部两行固定是「收藏 / 下载」
+            table.insert(item_table, 1, {
+                text = _("下载章节（离线阅读）"),
+                downloadMgr = true,
+            })
+        end
+        if self.library then
+            local isFav = self.library:isFavorite(key, comic.id)
+            table.insert(item_table, 1, {
+                text = isFav and _("★ 已收藏（点击取消）") or _("☆ 收藏本书"),
+                favToggle = true,
+            })
+        end
+        local menu = self:_navMenu{
+            title = self:_crumbTitle(key, bookTitle or key),
+            item_table = item_table,
+            onMenuSelect = function(menu_self, item)
+                self:_guard(_("章节"), function()
+                    if item.favToggle then
+                        local now = self.library:toggleFavorite({
+                            key = key, comicId = comic.id, title = bookTitle,
+                        })
+                        -- 不重建菜单（重建要重取详情=又一次网络请求）；用自消失
+                        -- 提示确认结果，标签在下次进入时刷新。
+                        item.text = now and _("★ 已收藏（点击取消）")
+                            or _("☆ 收藏本书")
+                        self:progressMessage(now and _("已加入收藏夹")
+                            or _("已取消收藏"))
+                    elseif item.downloadMgr then
+                        self:showChapterDownloads(key, bookTitle, chapter_rows)
+                    elseif item.epId then
+                        -- 【返回】章节菜单不关：阅读器盖在其上，关掉阅读器即回到
+                        -- 章节列表。此前先 close 再开阅读器，栈被拆掉，用户只剩
+                        -- 【关闭】一个出口（真机反馈"无返回按钮"）。
+                        self:showReader(key, item.comicId, item.epId,
+                            bookTitle, item.text)
+                    end
+                end)
+            end,
+        }
+        UIManager:show(menu)
+    end)
 end
 
 -- ---------- 层级 5.5：离线下载（章节落盘 / 缓存管理） ----------
@@ -1100,40 +1281,46 @@ end
 
 --- 取一话的页表 + 公共头。阅读与下载共用一条路：两处各写一遍 onImageLoad
 --- 的 headers 合并，迟早不一致。
---- 返回 (images, base_headers) 或 (nil, nil, err)；err 已是给用户看的话。
-function Browser:_loadEpImages(key, comicId, epId)
-    local base
+--- 【r10 M3】结果只经 on_done(images, base_headers, err)；err 已是给用户看的话。
+--- 同步就绪（桥没开异步 / 源是同步取值）时 on_done 在同一个栈帧里跑完。
+function Browser:_loadEpImagesAsync(key, comicId, epId, on_done)
+    local args = '[' .. '"' .. jesc(comicId) .. '","' .. jesc(epId) .. '"' .. ']'
+    local function loadEp(base)
+        self:_awaitSourceAsync(key, "comic.loadEp", args, function(ep, err2)
+            if not ep or type(ep) ~= "table" then
+                on_done(nil, nil, _("章节加载失败：")
+                    .. tostring(err2 or "no images") .. loginHint(err2))
+                return
+            end
+            -- 两种 Venera 返回形态：ChapterImages{ images: [...] } 或纯 URL 数组
+            local images = type(ep.images) == "table" and ep.images or ep
+            if images[1] == nil then
+                on_done(nil, nil, _("章节加载失败：源未返回任何图片"))
+                return
+            end
+            on_done(images, base)
+        end)
+    end
     -- onImageLoad 为可选声明（baozi/copy_manga 无）：仅存在时取 headers
-    if self:_hasMember(key, "comic.onImageLoad") then
-        local c, err = self:_awaitSource(key, "comic.onImageLoad",
-            '[' .. '"' .. jesc(comicId) .. '","' .. jesc(epId) .. '"' .. ']')
+    if not self:_hasMember(key, "comic.onImageLoad") then
+        loadEp(nil)
+        return
+    end
+    self:_awaitSourceAsync(key, "comic.onImageLoad", args, function(c, err)
         if not c then
-            return nil, nil, _("图片配置加载失败：") .. tostring(err) .. loginHint(err)
+            on_done(nil, nil, _("图片配置加载失败：") .. tostring(err)
+                .. loginHint(err))
+            return
         end
-        base = type(c.headers) == "table" and c.headers or nil
-    end
-    local ep, err2 = self:_awaitSource(key, "comic.loadEp",
-        '[' .. '"' .. jesc(comicId) .. '","' .. jesc(epId) .. '"' .. ']')
-    if not ep or type(ep) ~= "table" then
-        return nil, nil, _("章节加载失败：") .. tostring(err2 or "no images")
-            .. loginHint(err2)
-    end
-    -- 两种 Venera 返回形态：ChapterImages{ images: [...] } 或纯 URL 数组
-    local images = type(ep.images) == "table" and ep.images or ep
-    if images[1] == nil then
-        return nil, nil, _("章节加载失败：源未返回任何图片")
-    end
-    return images, base
+        loadEp(type(c.headers) == "table" and c.headers or nil)
+    end)
 end
 
-local function nowSec()
-    local ok, ffiutil = pcall(require, "ffi/util")
-    local gt = ok and type(ffiutil) == "table" and ffiutil.gettime or nil
-    if gt then
-        local tok, t = pcall(gt)
-        if tok and type(t) == "number" then return t end
-    end
-    return os.time()
+--- 拆成 (带协议的 host, 剥掉查询串与片段的 path)，日志与判据共用。查询串里
+--- 常有签名 token，绝不落进 logcat（与 bridge 的 http 日志同口径）。
+local function splitUrl(url)
+    local host = url:match("^[%a][%a%d+.%-]*://[^/]*") or ""
+    return host, url:sub(#host + 1):gsub("[?#].*$", "")
 end
 
 --- 取一张图的字节：合并公共头 + 单页头 + cookie jar + 插件代理（ADR-003），
@@ -1145,6 +1332,18 @@ end
 --- showReader 的 IMG_OPTS 注释与 netclient.new 的 default_timeout_block。
 function Browser:fetchImageBytes(url, base_headers, page_headers, opts)
     if type(url) ~= "string" or url == "" then return nil, "no url" end
+    local host, path = splitUrl(url)
+    if path:find("://", 1, true) then
+        -- 【真机 2026-09-27 doubaomanhua】站点把 chapter_images 改成绝对 URL 后，
+        -- 源 JS 仍照相对路径拼 imgBase，于是得到
+        -- `https://s1.baozicdn.com/https://s1.bzcdn.net/...`——图床对这种地址回
+        -- **500 而不是 404**，用户读作「图片打不开」而日志看着像网络故障。
+        -- 宿主修不了源的拼接，但至少先于网络判掉：省掉一整轮注定失败的尝试
+        -- （budget 4.5s），并把话说清是谁的锅。
+        logger.warn("ezvenera: 图片 URL 里主机被拼了两遍（源 JS 缺陷，非网络故障）:",
+            host, path)
+        return nil, "source built a double-hosted image url"
+    end
     opts = opts or {}
     local netclient = self.netclient
     if not netclient then return nil, "no request channel" end
@@ -1178,7 +1377,7 @@ function Browser:fetchImageBytes(url, base_headers, page_headers, opts)
     --   · 已钉死直连（此前探测成功过）→ 本拍直连；
     --   · 仅可疑（上一拍经代理传输失败）→ 本拍直连探测一次；
     --   · 探测成功才钉死，探测失败即收回、下一拍回代理。
-    local host = url:match("^[%a]+://[^/]+")
+    -- host 取自上面的 splitUrl（同一份拆解，别让键和日志用两套口径）。
     local had_proxy = proxy ~= nil and proxy ~= ""
     local direct_now = false
     if had_proxy and ((self._direct_hosts and self._direct_hosts[host])
@@ -1229,8 +1428,9 @@ function Browser:fetchImageBytes(url, base_headers, page_headers, opts)
             return resp.body, resp.headers
         end
     end
-    logger.warn("ezvenera: image fetch failed:", tostring(url:match("^[%a]+://[^/]+")),
-        last)
+    -- 带上不含查询串的路径：只看主机分不清「同一主机哪一类地址在坏」，而完整
+    -- URL 的签名 token 又不能进 logcat（见 splitUrl）。
+    logger.warn("ezvenera: image fetch failed:", host, path, last)
     return nil, last
 end
 
@@ -1321,7 +1521,24 @@ function Browser:downloadChapter(key, comicId, epId, bookTitle, chapterTitle, on
         if on_done then on_done(true, have) end
         return true, have
     end
-    local images, base, err = self:_loadEpImages(key, comicId, epId)
+    -- r10 M3：页表可能要到下一拍才拿得到（桥开了 async_http）。取到之后
+    -- 才进下载本体。同步环境（单测 / 开关关闭）里 on_done 同帧跑完，返回值
+    -- 与今天逐字节一致；真跨拍时本函数当场返回 nil，结果只经 on_done——
+    -- 与上面「挂了进度对话框即走异步」的既有契约同源。
+    local ok, info, got
+    self:_loadEpImagesAsync(key, comicId, epId, function(images, base, err)
+        ok, info = self:_startChapterDownload(dl, key, comicId, epId,
+            bookTitle, chapterTitle, images, base, err, on_done)
+        got = true
+    end)
+    if not got then return end
+    return ok, info
+end
+
+--- 下载本体（页表已到手）：逐页节拍 + 进度对话框 + 取消。
+--- images 为 nil 时 err 就是给用户看的那句话（_loadEpImagesAsync 的失败形状）。
+function Browser:_startChapterDownload(dl, key, comicId, epId, bookTitle,
+        chapterTitle, images, base, err, on_done)
     if not images then
         self.infoMessage(err or _("章节加载失败"))
         if on_done then on_done(false, err) end
@@ -1347,7 +1564,11 @@ function Browser:downloadChapter(key, comicId, epId, bookTitle, chapterTitle, on
     end
 
     local okpd, ProgressbarDialog = pcall(require, "ui/widget/progressbardialog")
-    if okpd and ProgressbarDialog and job.total and job.total > 0 then
+    if not okpd then
+        -- 降级必须留痕：静默 pcall 会把「没有进度条、也没有取消入口」吞得干干
+        -- 净净（r8 的 TextWidget 少传 face → 整条页码条消失就是同一类教训）。
+        logger.warn("ezvenera: progressbardialog 不可用，下载无进度条与取消入口")
+    elseif ProgressbarDialog and job.total and job.total > 0 then
         local okd, d = pcall(function()
             return ProgressbarDialog:new{
                 title = _("下载章节"),
@@ -1363,7 +1584,13 @@ function Browser:downloadChapter(key, comicId, epId, bookTitle, chapterTitle, on
         if okd then
             state.dialog = d
             pcall(function() d:show() end)
+        else
+            logger.warn("ezvenera: 下载进度对话框构造失败:", tostring(d))
         end
+    end
+    if job.resumed and job.resumed > 0 then
+        self:progressMessage((_("从第 %d 页继续下载（已保留 %d 页）"))
+            :format(job.resumed + 1, job.resumed))
     end
 
     local out = {}
@@ -1379,10 +1606,14 @@ function Browser:downloadChapter(key, comicId, epId, bookTitle, chapterTitle, on
                 :format(#info.pages, fmtSize(info.bytes)))
         else
             out.ok, out.err = false, tostring(info)
+            -- 取消/失败留下的半截现在是有用的（下次从这页续），报数给用户看
+            local part = dl:partialOf(key, comicId, epId)
+            local kept = part
+                and (_("（已保留 %d 页，下次从这里继续）")):format(#part.pages) or ""
             if tostring(info) == "已取消" then
-                self:progressMessage(_("已取消下载"))
+                self:progressMessage(_("已取消下载") .. kept)
             else
-                self.infoMessage(_("下载失败：") .. tostring(info))
+                self.infoMessage(_("下载失败：") .. tostring(info) .. kept)
             end
         end
         if on_done then
@@ -1484,6 +1715,21 @@ function Browser:showCacheManager()
     if #rows > 0 then
         table.insert(item_table, { text = _("清空全部下载"), clearAll = true })
     end
+    -- 未完成（取消/失败中断）的章：字节留着等续传，所以要能在这里看见并删掉，
+    -- 否则它们既不在已下载表里、又实际占着存储。
+    local parts = dl:listPartials()
+    if #parts > 0 then
+        table.insert(item_table, {
+            text = (_("◆ 未完成 %d 话 · 再点同一次下载会从断点继续")):format(#parts),
+            info_only = true })
+        for _, m in ipairs(parts) do
+            table.insert(item_table, {
+                text = (m.comicTitle or m.key) .. " / " .. (m.chapterTitle or m.epId),
+                mandatory = (_("已 %d 页 · %s")):format(#m.pages, fmtSize(m.bytes or 0)),
+                delPartial = m,
+            })
+        end
+    end
     if self.cookies then
         table.insert(item_table, { text = _("清空 Cookie（需重新登录各源）"),
             clearCookies = true })
@@ -1506,6 +1752,19 @@ function Browser:showCacheManager()
                         ok_callback = function()
                             self:_guard(_("清空下载"), function()
                                 dl:clearAll()
+                                UIManager:close(menu_self)
+                                self:showCacheManager()
+                            end)
+                        end,
+                    })
+                elseif item.delPartial then
+                    local m = item.delPartial
+                    UIManager:show(ConfirmBox:new{
+                        text = _("删除这半截未完成的下载？已下的页会一起清掉。"),
+                        ok_text = _("删除"),
+                        ok_callback = function()
+                            self:_guard(_("删除未完成下载"), function()
+                                dl:remove(m.key, m.comicId, m.epId)
                                 UIManager:close(menu_self)
                                 self:showCacheManager()
                             end)
@@ -1725,23 +1984,33 @@ function Browser:_hookLongPressSave(viewer, on_save)
     return true
 end
 
+--- 打开一章。页表来源两条路：已下载 → 完全离线；否则取源方法（可能跨拍）。
+--- 取完才进 `_openReader`——那 600 行阅读器闭包与页表来源无关，搬进续体会把
+--- 一次真机验证过的整体结构搅碎，所以按参数交接、正文一字不动。
 function Browser:showReader(key, comicId, epId, title, chapterTitle)
     local dl = self:getDownloader()
     -- 已下载 → 完全离线打开：一个网络请求都不发（无网/飞行模式也能读，
     -- 而且省掉 onImageLoad + loadEp 两次源方法调用，秒开）。
     local man = dl:manifestOf(key, comicId, epId)
-    local images, base
     if man then
-        images = Downloader.localImages(man)
-    else
-        self:progressMessage(_("章节加载中…"))
-        local imgs, b, err = self:_loadEpImages(key, comicId, epId)
-        if not imgs then
+        return self:_openReader(key, comicId, epId, title, chapterTitle,
+            dl, man, Downloader.localImages(man), nil)
+    end
+    self:progressMessage(_("章节加载中…"))
+    -- r10 M3：同步就绪时 on_done 同帧跑完（与今天逐字节一致），否则晚一拍开
+    -- 阅读器——期间主循环照常处理事件，ANR 判据不再被这两次源调用吃掉。
+    self:_loadEpImagesAsync(key, comicId, epId, function(images, base, err)
+        if not images then
             self.infoMessage(err or _("章节加载失败"))
             return
         end
-        images, base = imgs, b
-    end
+        self:_openReader(key, comicId, epId, title, chapterTitle,
+            dl, nil, images, base)
+    end)
+end
+
+function Browser:_openReader(key, comicId, epId, title, chapterTitle,
+        dl, man, images, base)
     if self.library then
         -- 章节确实取到了才记历史：失败也记会让「阅读历史」变成陷阱入口。
         self.library:recordRead({ key = key, comicId = comicId, title = title,
@@ -1809,7 +2078,8 @@ function Browser:showReader(key, comicId, epId, title, chapterTitle)
     --     中间存在一个"BB 已 free、widget 仍引用"的窗口；而我们同一页会返回
     --     **同一个**缓存 BB（见 servePage），true 时回翻就会把已 C.free 数据缓冲的
     --     BB 再交出去 → 悬垂读（BB:free 本身幂等，问题不在二次 free 而在 free 后仍被引用）。
-    -- 结论：BB 归我们所有，逐出/关闭时只丢引用，由 blitbuffer 的 ffi.gc 终值器回收。
+    -- 结论：BB 归我们所有 —— 逐出时由我们显式 :free()（见 servePage 的预算循环，
+    -- 等终值器会让 RSS 无上限地涨），关闭时只丢引用交给 blitbuffer 的 ffi.gc。
     local page_table = { image_disposable = false }
 
     -- 【性能 + 内存】图片**字节**缓存。ImageViewer 每次换页都会重新取
@@ -1880,10 +2150,11 @@ function Browser:showReader(key, comicId, epId, title, chapterTitle)
 
     --- 章节表：命中详情的缓存 → 源调用 → 离线兜底（本书已下载的话）。
     -- 第二返回值 true 表示拿到的是「离线子集」，第一档提示语要跟着变。
-    local function chapterRows()
-        local rows, err = self:_chapterList(key, comicId)
+    local function chapterRows(on_done)
+        self:_chapterListAsync(key, comicId, function(rows, err)
         if rows and #rows > 0 then
-            return rows, rows.__offline_subset or false, nil
+            on_done(rows, rows.__offline_subset or false, nil)
+            return
         end
         local out = {}
         for _, m in ipairs(dl:list()) do
@@ -1899,9 +2170,11 @@ function Browser:showReader(key, comicId, epId, title, chapterTitle)
             -- （真机一按白屏几秒），而离线子集本来就是当下能拿到的全部。
             -- 进详情 / 换源（invalidateSource）会用完整表覆盖或清掉它。
             out.__offline_subset = true
-            return self:_cacheChapters(key, comicId, out), true, nil
+            on_done(self:_cacheChapters(key, comicId, out), true, nil)
+            return
         end
-        return nil, false, err
+        on_done(nil, false, err)
+        end)
     end
 
     local function chapterIndex(rows)
@@ -1920,7 +2193,7 @@ function Browser:showReader(key, comicId, epId, title, chapterTitle)
     end
 
     local function stepChapter(delta)
-        local rows, partial, err = chapterRows()
+        chapterRows(function(rows, partial, err)
         if not rows then
             self.infoMessage(err or _("章节列表不可用"))
             return
@@ -1941,10 +2214,11 @@ function Browser:showReader(key, comicId, epId, title, chapterTitle)
             return
         end
         gotoChapter(target)
+        end)
     end
 
     local function showToc()
-        local rows, partial, err = chapterRows()
+        chapterRows(function(rows, partial, err)
         if not rows then
             self.infoMessage(err or _("章节列表不可用"))
             return
@@ -1986,6 +2260,7 @@ function Browser:showReader(key, comicId, epId, title, chapterTitle)
         UIManager:show(menu)
         -- 定位到当前章所在页：不跳的话千话书永远开在第一页
         if idx then menu:switchItemTable(nil, nil, idx) end
+        end)
     end
 
     local function showNavBar()
@@ -2245,6 +2520,15 @@ function Browser:showReader(key, comicId, epId, title, chapterTitle)
         for i = #prefetch_queue, 1, -1 do prefetch_queue[i] = nil end
     end
 
+    --- 「还有人在引用这张 BB 吗」——逐出时唯一的活引用是 viewer 手上那一份。
+    --- 换页瞬间 `self.image` 仍是**上一页**（imageviewer.lua:481 先取新页、
+    --- :485 才改 `_images_list_cur`），预取节拍触发逐出时它就是**当前页**，
+    --- 两种情况都靠这一条判据挡住。占位页被多页共用，同样不能放。
+    local function bbStillReferenced(bb)
+        if bb == placeholder_bb then return true end
+        return viewer ~= nil and viewer.image == bb
+    end
+
     local function servePage(pn)
         if images[pn] == nil then return placeholderPage() end
         if page_bar then page_bar.paint(pn) end
@@ -2286,12 +2570,28 @@ function Browser:showReader(key, comicId, epId, title, chapterTitle)
             entry.bb_bytes = tonumber(bb.stride) * tonumber(bb.h) or 0
             bb_bytes = bb_bytes + entry.bb_bytes
             table.insert(bb_order, pn)
-            while bb_bytes > BB_BUDGET and #bb_order > 1 do
+            -- attempts 上限：保护页会被排回队尾，没有上限时「剩下的全是保护页」
+            -- 会让这个循环转不停。
+            local attempts = #bb_order
+            while bb_bytes > BB_BUDGET and #bb_order > 1 and attempts > 0 do
+                attempts = attempts - 1
                 local old = table.remove(bb_order, 1)
-                -- pn 是正在显示的一页，绝不逐出
-                if old ~= pn and cache[old] and cache[old].bb then
-                    bb_bytes = bb_bytes - (cache[old].bb_bytes or 0)
-                    cache[old].bb = nil
+                local entry = cache[old]
+                if entry and entry.bb then
+                    -- pn 是正在交出的一页，绝不逐出
+                    if old == pn or bbStillReferenced(entry.bb) then
+                        table.insert(bb_order, old)
+                    else
+                        bb_bytes = bb_bytes - (entry.bb_bytes or 0)
+                        local doomed = entry.bb
+                        entry.bb = nil
+                        -- 显式回收，不等终值器。真机对照（2026-09-27 探针）：
+                        -- 只丢引用时 LuaJIT 的 ffi.gc 要等 Lua 堆涨够才跑，
+                        -- 连续翻页 600 页 RSS 一路涨到 2.13 GB；同样翻页每 5 页
+                        -- 做一次完整 GC 就稳在 146 MB —— 缺的是回收时机，
+                        -- 不是引用计数（旧写法没有多引用，只是还得晚一个数量级）。
+                        doomed:free()
+                    end
                 end
             end
         end
@@ -2723,14 +3023,16 @@ function Browser:_doLogin(key, jsKey, user, pwd)
     self:progressMessage(_("登录中…"))
     -- 注意不能写成 `local _, err`：`_` 是本模块的 gettext 别名，
     -- 遮蔽后下面的 _("登录失败：") 直接炸（真机表现：登录永远没反馈）
-    local _val, err = self:_awaitSource(key, "account.login",
-        "[" .. J.encode(user) .. "," .. J.encode(pwd) .. "]")
-    if err then
-        self.infoMessage(_("登录失败：") .. tostring(err))
-        return
-    end
-    self:_srcdata():markLoggedIn(jsKey)
-    self.infoMessage(_("登录成功。返回源主页重试即可。"))
+    self:_awaitSourceAsync(key, "account.login",
+        "[" .. J.encode(user) .. "," .. J.encode(pwd) .. "]",
+        function(_val, err)
+            if err then
+                self.infoMessage(_("登录失败：") .. tostring(err))
+                return
+            end
+            self:_srcdata():markLoggedIn(jsKey)
+            self.infoMessage(_("登录成功。返回源主页重试即可。"))
+        end)
 end
 
 --- 注销：照上游顺序（markLoggedOut → account.logout → 落盘）。
@@ -2743,12 +3045,14 @@ function Browser:_confirmLogout(key, jsKey)
         ok_callback = function()
             self:_guard(_("注销登录"), function()
                 self:_srcdata():markLoggedOut(jsKey)
-                local _val, err = self:_awaitSource(key, "account.logout",
-                    "[]")
-                if err then
-                    logger.warn("ezvenera: account.logout failed:", err)
-                end
-                self.infoMessage(_("已注销 ") .. tostring(jsKey))
+                self:_awaitSourceAsync(key, "account.logout", "[]",
+                    function(_val, err)
+                        -- 注销失败只留痕：本地凭据已经清了，不该再弹模态框
+                        if err then
+                            logger.warn("ezvenera: account.logout failed:", err)
+                        end
+                        self.infoMessage(_("已注销 ") .. tostring(jsKey))
+                    end)
             end)
         end,
     })

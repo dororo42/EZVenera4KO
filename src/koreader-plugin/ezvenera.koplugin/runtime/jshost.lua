@@ -16,8 +16,12 @@ supported." —— FFI 回调按值返回 JSValue（16B 结构体）全架构文
     绝不让错误跨越 C 栈帧。
 shim 缺失/安装失败 → 引擎保持"可用性探测通过但初始化失败且原因明确"。
 
-消息桥 M1 为同步返回：__ezv_post(jsonStr) → JS 字符串结果。
-delay 返回 __delay_ms 标记，异步调度在 S2 后续接入。
+消息桥默认同步返回：__ezv_post(jsonStr) → JS 字符串结果。
+delay 返回 __delay_ms 标记（glue 里包成 thenable，由泵排空）。
+r10 M2：http 可返回 {__pending=id}——glue 把它变成真 Promise，
+pump() 每拍先推一拍网络（NetClient:tickAsync），再把已完成响应
+eval 成 __ezv_resolve(id, json) 兑现。开关在桥（async_http），
+见 runtime/bridge.lua 文件头。
 
 加载探测：插件 lib/（pluginloader 已加入 package.cpath）→ 系统名。
 ]]
@@ -25,6 +29,9 @@ delay 返回 __delay_ms 标记，异步调度在 S2 后续接入。
 local oklog, logger = pcall(require, "logger")
 if not oklog or not logger then logger = nil end
 local function logwarn(...) if logger and logger.warn then logger.warn(...) end end
+-- 逐条消息的流水账走 dbg：logger 默认级别是 info，dbg 被上游置为 noop，
+-- 所以正常跑不产生任何输出；要复查时开「开发者选项 → 启用调试日志」即原样回来。
+local function logdbg(...) if logger and logger.dbg then logger.dbg(...) end end
 
 local JsHost = {}
 JsHost.__index = JsHost
@@ -128,9 +135,44 @@ function sendMessage(m) {
         return { __delay_ms: out.__delay_ms,
                  then: function(fn) { t.fn = fn; } };
     }
+    // r10 M2：桥回了挂起标记 ⇒ 这次 sendMessage 的**响应**自己就是 Promise。
+    // init.js 两处调用（sendRequest / 相关路径）都是 `await sendMessage(...)`，
+    // 而 await 对非 Promise 值等价于原样取值，所以同步返回的形状一个字节都不用改。
+    if (out && out.__pending !== undefined && out.__pending !== null) {
+        return __ezv_hold(out.__pending);
+    }
     return out;
 }
 var __ezv_timers = [];
+var __ezv_pending = {};
+function __ezv_hold(id) {
+    return new Promise(function(resolve, reject) {
+        __ezv_pending[id] = { resolve: resolve, reject: reject };
+    });
+}
+// 兑现一条挂起请求。result_json 是**同步路径同一形状**的响应（已经过
+// __ezv_untag_bytes，二进制照旧还原成 ArrayBuffer）；err_str 只用于 Lua 侧
+// 连响应都构造不出来的病态情形。
+function __ezv_resolve(id, result_json, err_str) {
+    const slot = __ezv_pending[id];
+    if (!slot) { return false; }      // 已兑现/引擎已换 ⇒ 幂等丢弃
+    delete __ezv_pending[id];
+    if (err_str) { slot.reject(new Error(err_str)); return true; }
+    let v = null;
+    if (result_json !== undefined && result_json !== null) {
+        v = __ezv_untag_bytes(JSON.parse(result_json), 0);
+        if (v && v.__error) { slot.reject(new Error(v.__error)); return true; }
+    }
+    slot.resolve(v);
+    return true;
+}
+// 引擎被换掉 / 泵永久停摆时，这些 Promise 永远没人兑现；调用方等的是超时，
+// 但计数用来把「卡住的请求」落进日志，别让它在 UI 上表现为无解释的等待。
+function __ezv_pending_count() {
+    var n = 0;
+    for (var k in __ezv_pending) { if (__ezv_pending[k]) n++; }
+    return n;
+}
 function __ezv_poll_timers(now_ms) {
     var fired = 0;
     var remain = [];
@@ -503,7 +545,10 @@ function JsHost:_bridgeHandler(msgstr)
         return json.encode({ __error = "bridge: bad JSON" })
     end
     -- 真机排查锚（R5）：只记 method 时一条 "html" 日志对应几十种 op，
-    -- 无法定位失败的选择器。op 名与 query 一并落 logcat（截断防刷屏）。
+    -- 无法定位失败的选择器。op 名与 query 一并落日志（截断防刷屏）。
+    -- 2026-09-26：这组逐条流水账原先是 warn —— 读一话 127 张图就是几百条
+    -- `load_setting k=imageHost` 糊满 logcat。它只在排查时有用，故降为 dbg
+    -- （logger 默认 info，dbg 是 noop；开「开发者选项 → 启用调试日志」即回来）。
     local sub = msg["function"]
     if sub then
         sub = tostring(sub) .. (msg.query
@@ -520,11 +565,14 @@ function JsHost:_bridgeHandler(msgstr)
     if msg.setting_key then
         detail = detail .. " k=" .. tostring(msg.setting_key)
     end
-    logwarn("ezvenera bridge <-", tostring(msg.method), sub or "", detail)
+    logdbg("ezvenera bridge <-", tostring(msg.method), sub or "", detail)
     local value, iserr = self.bridge:handle(msg)
     if msg.method == "load_setting" or msg.method == "http" then
         local r
-        if type(value) == "table" then
+        if type(value) == "table" and not iserr and value.__pending ~= nil then
+            -- r10 M2：这一条只是「已受理」，状态码在兑现那一拍的另一行日志里
+            r = "pending=" .. tostring(value.__pending)
+        elseif type(value) == "table" then
             r = iserr and tostring(value.__error)
                 or ("status=" .. tostring(value.status))
         elseif value == nil then
@@ -532,7 +580,12 @@ function JsHost:_bridgeHandler(msgstr)
         else
             r = tostring(value)
         end
-        logwarn("ezvenera bridge ->", tostring(msg.method), r:sub(1, 100))
+        -- 联网失败仍留 warn：那是真故障，不能跟流水账一起哑掉
+        if msg.method == "http" and iserr then
+            logwarn("ezvenera bridge ->", tostring(msg.method), r:sub(1, 100))
+        else
+            logdbg("ezvenera bridge ->", tostring(msg.method), r:sub(1, 100))
+        end
     end
     local out
     if iserr then
@@ -685,9 +738,14 @@ function JsHost:_pollTimers()
     return fired
 end
 
---- 泵 = promise 微任务 + 到期定时器。返回 (executed, drained)。
---- drained=false 表示本拍触顶（job 或 timer），还有积压。
+--- 泵 = 网络推进 + 响应兑现 + promise 微任务 + 到期定时器。
+--- 返回 (executed, drained)。drained=false 表示本拍触顶（job 或 timer）。
+--- 顺序（r10 M2）：先把在飞请求往前推一拍，再把这一拍内完成的结果投给 JS，
+--- **然后**才排空 promise 队列——兑现会往队列里塞续体，同拍跑掉就等于没多等；
+--- 反过来先排队列，每个网络结果平白多一拍（0.5s）才回到源里。
 function JsHost:pump(max_jobs)
+    self:_tickNet()
+    self:_deliverHttp()
     local executed, drained = self:_drainJobs(max_jobs)
     local fired = self:_pollTimers()
     return executed, drained and (fired < self.EZV_TIMERS_PER_PUMP)
@@ -714,6 +772,90 @@ end
 -- 把 \" 的反斜杠当字面量，破坏拼接 eval 的字符串字面量）
 local function jsStringEscape(s)
     return (s:gsub("\\", "\\\\"):gsub('"', '\\"'))
+end
+
+-- r10 M2 的两个泵内步骤**必须**定义在 jsStringEscape 之后：Lua 的 local 只在
+-- 定义点之后的作用域里可见，写在本行之前会让 _deliverHttp 里的
+-- jsStringEscape 变成 nil 全局（拼 eval 串时炸）。
+JsHost.PUMP_NET_SLICE_SEC = 0.030
+
+--- 把任意 Lua 字符串变成合法的 JS **字符串字面量内容**（不含外层引号）。
+--- jsStringEscape 只管引号与反斜杠；这里的响应体是 json.encode 的产物，
+--- 而 json 实现并不保证把控制字符全部转义（KOReader 的 json 与 cjson 行为
+--- 就不同）。一个裸换行会把整条 `__ezv_resolve(...)` eval 变成
+--- SyntaxError——那等于把这条请求的结果丢掉，所以边界上宁可多转义。
+--- 顺序：先 doubling 反斜杠，再插入自己的转义序列（否则会被二次转义）。
+local function jsLiteral(s)
+    local out = jsStringEscape(s)
+    return (out:gsub("%c", function(c)
+        local b = c:byte()
+        if b == 10 then return "\\n" end
+        if b == 13 then return "\\r" end
+        if b == 9 then return "\\t" end
+        return string.format("\\u%04x", b)
+    end))
+end
+
+--- 推进 netclient 的非阻塞传输一拍（协程 resume，每个在飞任务一次）。
+--- 没有桥 / 没有 netclient（单测桩）时静默跳过。
+function JsHost:_tickNet()
+    local nc = self.bridge and self.bridge.netclient
+    if not (nc and nc.tickAsync) then return nil end
+    local ok, res = pcall(function()
+        return nc:tickAsync(self.PUMP_NET_SLICE_SEC)
+    end)
+    if not ok then
+        logwarn("ezvenera net tick failed:", tostring(res))
+        return nil
+    end
+    return res
+end
+
+--- 把桥里已完成的异步 http 响应兑现给 JS。
+--- 形状与同步路径逐字节同源（同一个 httpFinish + 同一个 json.encode），
+--- 源看到的 `{status, headers, body, error}` 不会因为是异步而变形。
+--- 逐条 eval：一条兑现里源的续体常会同步发起下一条请求，批量投递会让它们
+--- 全挤在同一拍，非阻塞的意义就没了。
+function JsHost:_deliverHttp()
+    local br = self.bridge
+    if not (br and br.takeHttpReady and self.initialized and self.ctx) then
+        return 0
+    end
+    local okl, ready = pcall(function() return br:takeHttpReady() end)
+    if not okl or not ready then return 0 end
+    local n = 0
+    for _, item in ipairs(ready) do
+        local okj, encoded = pcall(function()
+            return self.json.encode(item.out)
+        end)
+        local code
+        if okj and type(encoded) == "string" then
+            code = '__ezv_resolve(' .. tostring(item.id) .. ', "'
+                .. jsLiteral(encoded) .. '", null)'
+        else
+            -- 编码失败也要兑现，否则这条 Promise 永挂（调用方只能等超时）
+            code = '__ezv_resolve(' .. tostring(item.id)
+                .. ', null, "bridge: async encode failed")'
+        end
+        local oke, err = self:_evalRaw(code)
+        if not oke then
+            logwarn("ezvenera resolve failed", tostring(item.id),
+                tostring(err):sub(1, 120))
+        end
+        n = n + 1
+    end
+    return n
+end
+
+--- 这一拍之后还有活儿吗？main.lua 用它决定下一拍的间隔：
+--- 网络在飞时把泵周期从 0.5s 收到 0.05s（一次等待 = 一个周期，
+--- 否则一次握手要按 0.5s 步进），空闲时回到 0.5s 不吃 CPU。
+function JsHost:busy()
+    local nc = self.bridge and self.bridge.netclient
+    if nc and nc.asyncPending and nc:asyncPending() > 0 then return true end
+    if self.bridge and self.bridge.httpInflight
+            and self.bridge:httpInflight() > 0 then return true end
+    return false
 end
 
 --- JSON null 的 Lua 哨兵**是 truthy**：cjson 给 lightuserdata，KOReader 的
@@ -941,6 +1083,11 @@ function JsHost:dispose()
     if self._shim_cb then
         self._shim_cb:free()
         self._shim_cb = nil
+    end
+    -- 运行时都要没了，在飞请求先取消：硬关 fd，且别让后续泵把结果
+    -- eval 进一个已释放的 ctx
+    if self.bridge and self.bridge.abortHttp then
+        pcall(function() self.bridge:abortHttp() end)
     end
     if self.ctx then self.lib.JS_FreeContext(self.ctx) self.ctx = nil end
     if self.rt then self.lib.JS_FreeRuntime(self.rt) self.rt = nil end

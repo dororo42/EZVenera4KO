@@ -1,5 +1,17 @@
 -- unit test: netclient.lua — parseURL + 代理注入逻辑（AC2.3）
 local NetClient = require("netclient")
+-- 假 luasocket/LuaSec 栈及其辅助函数已抽到 tests/tlsfake.lua：r10 M2 之后端到端测试要用**同一份**栈
+-- 把真 NetClient 串到真 Bridge / 真 JsHost:pump()，两处各写一份必然漂移。
+
+local TlsFake = require("tests.tlsfake")
+local makeFakeHttp = TlsFake.makeFakeHttp
+local fake_ltn12 = TlsFake.ltn12
+local withFakeModules = TlsFake.withFakeModules
+local logFind = TlsFake.logFind
+local countLog = TlsFake.countLog
+local withTlsStack = TlsFake.withTlsStack
+local drain = TlsFake.drain
+
 
 local function assert_eq(label, expected, actual)
     assert(expected == actual,
@@ -187,160 +199,6 @@ end
 -- 调用形状。此处以 preload 桩覆盖：reqt.proxy 契约 + 全局 _M.PROXY
 -- 的覆盖/恢复（"禁用直连 / 启用经代理 / 全局叠加"三态）。
 
-local function makeFakeHttp(opts)
-    opts = opts or {}
-    local fake
-    fake = {
-        TIMEOUT = 10,
-        PROXY = opts.global_proxy,          -- 模拟 NetworkMgr:setHTTPProxy 写入
-        _calls = {},
-        responses = nil,                    -- {code, headers} 队列（TLS 桩用）
-        request = function(reqt)
-            fake._calls[#fake._calls + 1] = {
-                reqt = reqt,
-                proxy_during = reqt.proxy,
-                global_during = fake.PROXY, -- 请求执行时看到的全局值
-            }
-            if opts.fail then return nil, "timeout" end
-            -- 自建 HTTPS 路径会传 create：按 luasocket 的 _M.open 形状走一遍
-            if reqt.create then return fake.open_with(reqt) end
-            return 1, 200, { ["content-type"] = "text/plain" },
-                "HTTP/1.1 200 OK"
-        end,
-    }
-    return fake
-end
-
-local fake_ltn12 = {
-    sink = { table = function(t) return { t } end },
-    source = { string = function(s) return { s } end },
-}
-
---- 在桩模块下执行 fn；结束恢复 preload/package.loaded 现场
-local function withFakeModules(mods, fn)
-    local saved_preload, saved_loaded = {}, {}
-    for name, _ in pairs(mods) do
-        saved_preload[name] = package.preload[name]
-        saved_loaded[name] = package.loaded[name]
-    end
-    for name, mod in pairs(mods) do
-        package.preload[name] = function() return mod end
-        package.loaded[name] = nil
-    end
-    local ok, err = pcall(fn)
-    for name, _ in pairs(mods) do
-        package.preload[name] = saved_preload[name]
-        if saved_loaded[name] ~= nil then
-            package.loaded[name] = saved_loaded[name]
-        else
-            package.loaded[name] = nil
-        end
-    end
-    if not ok then error(err) end
-end
-
---- log 中首个匹配行（Lua 模式），无则 nil
-local function logFind(log, pat)
-    for i, line in ipairs(log) do
-        if line:find(pat) then return i end
-    end
-    return nil
-end
-
---- 桩化 LuaJIT 环境下不存在的 socket / LuaSec / socket.url / socket.http
---- 内部：让 fake http.request 按 luasocket `_M.open` 的真实动作顺序驱动
---- conn（create → settimeout → connect(代理|目标) → send 请求行），从而
---- 能断言 CONNECT 隧道 + TLS 包装 + origin-form 请求行。返回动作流水。
-local function withTlsStack(fake, tls_opts)
-    tls_opts = tls_opts or {}
-    local log = {}
-    local reply = tls_opts.reply
-        or { "HTTP/1.1 200 Connection established", "" }
-    fake.responses = tls_opts.responses or {}
-
-    local function newsock(kind)
-        local api, rx = {}, 0
-        api.connect = function(self, host, port)
-            log[#log + 1] = kind .. ".connect " .. host .. ":" .. tostring(port)
-            if tls_opts.connect_fails then return nil, "connection refused" end
-            return 1
-        end
-        api.send = function(self, data)
-            log[#log + 1] = kind .. ".send " .. data
-            return #data
-        end
-        api.receive = function(self, pat)
-            rx = rx + 1
-            local v = reply[rx]
-            log[#log + 1] = kind .. ".receive " .. tostring(v)
-            return v
-        end
-        api.settimeout = function(self, t)
-            log[#log + 1] = kind .. ".settimeout " .. tostring(t)
-            return 1
-        end
-        api.sni = function(self, h)
-            log[#log + 1] = kind .. ".sni " .. h
-            return 1
-        end
-        api.dohandshake = function(self)
-            log[#log + 1] = kind .. ".dohandshake"
-            return 1
-        end
-        api.getfd = function(self) return 7 end
-        api.dirty = function(self) return false end
-        api.close = function(self)
-            log[#log + 1] = kind .. ".close"
-            return 1
-        end
-        -- luasocket/LuaSec 都是 metatable.__index 挂方法：conn 侧要按
-        -- getmetatable(x).__index 取，故桩对象必须同形
-        return setmetatable({}, { __index = api })
-    end
-
-    fake.open_with = function(reqt)
-        local conn = reqt.create()
-        if not conn then return nil, "create failed" end
-        conn:settimeout(fake.TIMEOUT)
-        local host = reqt.url:match("^%a[%w+.-]*://([^/:]+)")
-        local tport = tonumber(reqt.url:match("^%a[%w+.-]*://[^/:]+:(%d+)")) or 443
-        local p = reqt.proxy or fake.PROXY
-        if p then
-            host = p:match("^%a[%w+.-]*://([^/:]+)") or host
-            tport = tonumber(p:match(":(%d+)$")) or 3128
-        end
-        local ok, err = conn:connect(host, tport)
-        if not ok then return nil, err end
-        conn:send((reqt.method or "GET") .. " " .. (reqt.uri or "/")
-            .. " HTTP/1.1\r\n")
-        local r = table.remove(fake.responses, 1) or { code = 200, headers = {} }
-        conn:close()
-        return 1, r.code, r.headers, "HTTP/1.1 " .. tostring(r.code)
-    end
-
-    fake.mods = {
-        ["socket.http"] = fake,
-        ["socket"] = { tcp = function() return newsock("tcp") end },
-        ["ssl"] = {
-            wrap = function(sock, params)
-                log[#log + 1] = "ssl.wrap mode=" .. tostring(params.mode)
-                    .. " verify=" .. tostring(params.verify)
-                    .. " protocol=" .. tostring(params.protocol)
-                return newsock("tls")
-            end,
-        },
-        ["socket.url"] = {
-            absolute = function(base, loc)
-                if loc:match("^%a[%w+.-]*://") then return loc end
-                local root = base:match("^%a[%w+.-]*://[^/]*")
-                if loc:match("^/") then return root .. loc end
-                return root .. "/" .. loc
-            end,
-        },
-        ltn12 = fake_ltn12,
-    }
-    return log
-end
 
 function tests.builtin_disabled_proxy_never_passes_empty_string()
     -- 审查 H1：禁用代理（"" 哨兵）绝不能把空串写进 reqt.proxy
@@ -535,14 +393,6 @@ function tests.builtin_lib_require_failure_reports_clearly()
     return true
 end
 
---- 日志中匹配 Lua 模式 `pat` 的行数
-local function countLog(log, pat)
-    local n = 0
-    for _, line in ipairs(log) do
-        if line:find(pat) then n = n + 1 end
-    end
-    return n
-end
 
 local TPROXY = "http://203.0.113.10:8118"
 
@@ -750,6 +600,288 @@ function tests.request_never_throws_on_bad_method_or_headers()
                            headers = "not-a-table" })
     assert_eq("bad method coerced", "42", r.status and "42" or "42")
     -- 到这里没抛错即通过：transport 收到的 method 已是字符串
+    return true
+end
+
+-- ---- r10 M1：非阻塞（AsyncNet 驱动）HTTPS 路径 ----
+-- 判据的核心不是"最后拿到 200"，而是**等待发生在节拍之间**：一次 resume
+-- 只能推进一个「现在没数据」的动作，UI 因此在两次轮询之间拿得到事件。
+
+
+function tests.async_https_waits_between_ticks_not_inside_one()
+    local fake = makeFakeHttp{}
+    -- 四个「现在没数据」的动作：非阻塞 connect、两次握手 wantread、一次读
+    local log, env = withTlsStack(fake, {
+        blocked = { connect = 1, handshake = 2, receive = 1 },
+        responses = { { code = 200, headers = { ["content-length"] = "5" } } },
+    })
+    withFakeModules(fake.mods, function()
+        local nc = NetClient.new()
+        local out = {}
+        env.done = false
+        local job, err = nc:requestAsync({ url = "https://api.example.com/list",
+                                           proxy = TPROXY },
+            function(ok, resp)
+                out.ok, out.resp = ok, resp
+                env.done = true
+            end)
+        assert(job ~= nil, "作业创建失败: " .. tostring(err))
+        -- 第 1 拍：非阻塞 connect 报 timeout → 已经让出了（没在原地等满 4s）
+        env.t = env.t + 0.05
+        nc:tickAsync()
+        assert_eq("yielded on the first would-block", false, env.done)
+        assert_eq("waited through a non-blocking select", 0, env.poll_timeout)
+        local ticks = drain(nc, env)
+        assert(ticks ~= nil, "must finish within ticks")
+        assert_eq("reported success", true,
+            out.ok and true or tostring(out.resp and out.resp.error))
+        assert_eq("status", 200, out.resp.status)
+        assert_eq("每一次 would-block 都真的等过一拍", 4, env.not_ready)
+        -- 一拍一个 resume ⇒ 四次等待就是四拍（多一拍都不算：没在原地死等，
+        -- 也没在一拍里把整笔事务跑完）
+        assert_eq("one wait per tick", 4, ticks)
+        assert_eq("async conn armed non-blocking", true,
+            logFind(log, "tcp%.settimeout 0") ~= nil)
+        assert_eq("never armed the blocking http.TIMEOUT", nil,
+            logFind(log, "settimeout " .. tostring(fake.TIMEOUT)))
+    end)
+    return true
+end
+
+function tests.async_handshake_resumes_across_wantread()
+    -- M0 真机实测的形状：wantread 不是失败，握手续得上。桩里把它排成
+    -- wantread, wantread, 成功 —— 必须最终完成整笔事务而不是报握手失败。
+    local fake = makeFakeHttp{}
+    local log, env = withTlsStack(fake, {
+        blocked = { handshake = 2 },
+        responses = { { code = 204, headers = { ["content-length"] = "0" } } },
+    })
+    withFakeModules(fake.mods, function()
+        local nc = NetClient.new()
+        local out = {}
+        env.done = false
+        nc:requestAsync({ url = "https://api.example.com/ping", proxy = TPROXY },
+            function(ok, resp) out.ok, out.resp = ok, resp; env.done = true end)
+        local ticks = drain(nc, env)
+        assert_eq("finished", true, ticks ~= nil)
+        assert_eq("ok", true, out.ok)
+        assert_eq("status", 204, out.resp.status)
+        assert_eq("三次握手尝试（两次 wantread + 一次成）", 3,
+            countLog(log, "tls%.dohandshake$"))
+        assert_eq("两次 wantread", 2, countLog(log, "wantread"))
+        assert_eq("两次各等一拍", 2, env.not_ready)
+    end)
+    return true
+end
+
+function tests.async_cancel_closes_fd_immediately()
+    local fake = makeFakeHttp{}
+    local log, env = withTlsStack(fake, {
+        blocked = { connect = 1, handshake = 3 },
+        responses = { { code = 200, headers = {} } },
+    })
+    withFakeModules(fake.mods, function()
+        local nc = NetClient.new()
+        local out = {}
+        env.done = false
+        local job = nc:requestAsync({ url = "https://api.example.com/big.webp",
+                                      proxy = TPROXY },
+            function(ok, resp) out.ok, out.resp = ok, resp; env.done = true end)
+        env.t = env.t + 0.05
+        nc:tickAsync()                       -- 停在握手的等待里
+        assert_eq("still in flight", false, env.done)
+        job:cancel()
+        -- 取消是 UI 线程调的：fd 必须当场释放，不能等下一拍协程 unwind
+        assert_eq("socket closed at cancel time", true,
+            countLog(log, "tcp%.close") >= 1)
+        drain(nc, env)
+        assert_eq("reported failure", false, out.ok)
+        assert_eq("reason surfaced", true,
+            tostring(out.resp.error):find("cancelled", 1, true) ~= nil)
+        -- 半途隧道绝不能留给下一个请求
+        assert_eq("no tunnel parked", 0, (function()
+            local n = 0
+            for _ in pairs(nc._tunnels) do n = n + 1 end
+            return n
+        end)())
+    end)
+    return true
+end
+
+function tests.async_tunnel_pools_and_sync_request_reuses_it_blocking()
+    -- 同一条池化隧道先被异步请求用、再被同步请求用：_aio 必须跟着本次
+    -- 请求走。异步段有 select 轮询，同步段一个都不许有（否则拿着死作业的
+    -- io 去 yield = "attempt to yield from outside a coroutine"）。
+    local fake = makeFakeHttp{}
+    local log, env = withTlsStack(fake, {
+        blocked = { connect = 1 },
+        responses = {
+            { code = 200, headers = { ["content-length"] = "5" } },
+            { code = 200, headers = { ["content-length"] = "6" } },
+        },
+    })
+    withFakeModules(fake.mods, function()
+        local nc = NetClient.new()
+        local out = {}
+        env.done = false
+        nc:requestAsync({ url = "https://img.example.com/1.webp",
+                          proxy = TPROXY },
+            function(ok, resp) out.ok, out.resp = ok, resp; env.done = true end)
+        drain(nc, env)
+        assert_eq("async first ok", true, out.ok)
+        assert_eq("async waited exactly once", 1, env.not_ready)
+        local polls_after_async = env.polls
+        local r2 = nc:request{ url = "https://img.example.com/2.webp",
+                               proxy = TPROXY }
+        assert_eq("sync reuse ok", 200, r2.status)
+        assert_eq("sync path polled nothing", polls_after_async, env.polls)
+        assert_eq("reuse means one tunnel", 1, countLog(log, "tls%.dohandshake$"))
+        assert_eq("sync settimeout not forced to 0", true,
+            logFind(log, "tls%.settimeout 4") ~= nil)
+    end)
+    return true
+end
+
+function tests.async_inflight_cap_queues_second_request()
+    local fake = makeFakeHttp{}
+    local _, env = withTlsStack(fake, {
+        -- 两次请求各建一条隧道，各撞一次非阻塞 connect
+        blocked = { connect = 2 },
+        responses = {
+            { code = 200, headers = { ["content-length"] = "5" } },
+            { code = 200, headers = { ["content-length"] = "6" } },
+        },
+    })
+    withFakeModules(fake.mods, function()
+        local nc = NetClient.new()
+        nc.async_max_inflight = 1          -- 先证明排队，再靠补位跑完
+        local done, outs, n = {}, {}, 0
+        env.done = false
+        nc:requestAsync({ url = "https://img.example.com/a.webp", proxy = TPROXY },
+            function(ok, resp) done.a = ok; n = n + 1; env.done = n == 2
+                outs.a = resp end)
+        nc:requestAsync({ url = "https://img.example.com/b.webp", proxy = TPROXY },
+            function(ok, resp) done.b = ok; n = n + 1; env.done = n == 2
+                outs.b = resp end)
+        local an = nc:_asyncnet()
+        assert_eq("both tracked", 2, an:pending())
+        assert_eq("one in flight", 1, #an._order)
+        assert_eq("one queued", 1, #an._waiting)
+        env.t = env.t + 0.05
+        nc:tickAsync()
+        assert_eq("first still waiting on connect", nil, done.a)
+        assert_eq("queued one did not start", 1, #an._waiting)
+        assert_eq("cap means only one job polled", 1, env.polls)
+        env.done = false
+        local ticks = drain(nc, env, 40)
+        assert(ticks ~= nil, "both finish within ticks: pending="
+            .. an:pending() .. " a=" .. tostring(done.a)
+            .. " b=" .. tostring(done.b))
+        assert_eq("a done", true, done.a)
+        assert_eq("b done", true, done.b)
+        assert_eq("queue drained", 0, #an._waiting)
+    end)
+    return true
+end
+
+function tests.async_never_throws_when_transport_missing()
+    -- select 不可用（裸 LuaJIT / 桩环境）：必须明确报不可用，而不是把
+    -- 调用方带进一条半路径
+    withFakeModules({
+        ["socket.http"] = makeFakeHttp{},
+        ["socket"] = { tcp = function() return nil end },
+        ltn12 = fake_ltn12,
+    }, function()
+        local nc = NetClient.new()
+        local job, err = nc:requestAsync({ url = "https://x.example.com/" },
+            function() end)
+        assert_eq("no job", nil, job)
+        assert_eq("explained", true, tostring(err):find("select") ~= nil)
+    end)
+    return true
+end
+
+function tests.async_pending_counter_never_nil()
+    -- 泵用它决定周期（busy 判据）：返回 nil 会被当成「有活儿」，
+    -- 于是空闲时也一直按 0.05s 快转，白耗电。
+    withFakeModules({
+        ["socket.http"] = makeFakeHttp{},
+        ["socket"] = { tcp = function() return nil end },
+        ltn12 = fake_ltn12,
+    }, function()
+        local nc = NetClient.new()
+        assert_eq("调度器还没建 = 0", 0, nc:asyncPending())
+        assert_eq("无调度器时 tickAsync 返回 nil", nil, nc:tickAsync(0.01))
+    end)
+    local fake = makeFakeHttp{}
+    local log, env = withTlsStack(fake, {
+        responses = { { code = 200, body = "ping" } },
+    })
+    withFakeModules(fake.mods, function()
+        local nc = NetClient.new()
+        env.done = false
+        nc:requestAsync({ url = "https://api.example.com/ping", proxy = TPROXY },
+            function() env.done = true end)
+        assert_eq("提交后立刻计数（在飞 + 队列）", 1, nc:asyncPending())
+        local ticks = drain(nc, env)
+        assert_eq("跑完了", true, ticks ~= nil)
+        assert_eq("收尾后归零", 0, nc:asyncPending())
+    end)
+    return true
+end
+
+-- ---- r10 M1 真机回归：conn 必须是 luasocket conn 的合格替身 ----
+-- luasocket 的 receivestatusline（common/socket/http.lua）读状态行是**两步**：
+--   local status = self.try(self.c:receive(5))          -- "HTTP/"
+--   status = self.try(self.c:receive("*l", status))     -- 前缀接回整行
+--   local code = socket.skip(2, string.find(status, "HTTP/%d*%.%d* (%d%d%d)"))
+-- M1 给 conn 包收发时把签名写成了 `function(self2, pattern)`，第二个入参就此
+-- 消失 → 拿到的是 "1.1 200 OK" → 上面那个 find 失配 → socket.try 抛错 →
+-- 每一次 https 请求都报 `请求失败: 1.1 200 OK`（真机 2026-09-27 症状：
+-- 阅读历史/继续上次阅读打不开，而服务器其实回了 200）。
+
+function tests.conn_receive_matches_luasocket_statusline_two_step()
+    local fake = makeFakeHttp{}
+    withTlsStack(fake, { reply = { "HTTP/1.1 200 OK", "" } })
+    withFakeModules(fake.mods, function()
+        local nc = NetClient.new()
+        local libs = nc:_libs()
+        local tgt = NetClient.parseURL(
+            "https://www.doubaomanhua.com/detail/3PeO0Lw1Z0/27.html")
+        local conn = NetClient._tlsConn(libs, tgt, nil, 5, nc, nil, nil)()
+        assert_eq("连接建立", 1, conn:connect(tgt.host, tgt.port))
+        local head = conn:receive(5)
+        assert_eq("先按 5 字节读出头", "HTTP/", head)
+        local line = conn:receive("*l", head)
+        -- socket.skip(2, find(...)) == 第 3 个返回值（第一个捕获组）
+        local code = select(3, string.find(line, "HTTP/%d*%.%d* (%d%d%d)"))
+        assert_eq("前缀必须接回整行", "HTTP/1.1 200 OK", line)
+        assert_eq("luasocket 据此判出的状态码", "200", code)
+    end)
+    return true
+end
+
+function tests.async_conn_receive_keeps_prefix_argument()
+    -- 异步那条包装（AsyncNet.retry 包住收发）也必须原样转发可变参数：
+    -- 取消/非阻塞改的是「什么时候等」，不是「收到什么」。
+    local fake = makeFakeHttp{}
+    withTlsStack(fake, { reply = { "HTTP/1.1 200 OK", "" } })
+    withFakeModules(fake.mods, function()
+        local AsyncNet = require("runtime/asyncnet")
+        local nc = NetClient.new()
+        local libs = nc:_libs()
+        local tgt = NetClient.parseURL("https://www.doubaomanhua.com/detail/x/1.html")
+        local got
+        local net = AsyncNet.new()
+        net:submit(function(io)
+            local conn = NetClient._tlsConn(libs, tgt, nil, 5, nc, nil, nil, io)()
+            conn:connect(tgt.host, tgt.port)
+            got = conn:receive("*l", conn:receive(5))
+            return got
+        end)
+        net:tick(10)
+        assert_eq("异步包装同样接回整行", "HTTP/1.1 200 OK", got)
+    end)
     return true
 end
 

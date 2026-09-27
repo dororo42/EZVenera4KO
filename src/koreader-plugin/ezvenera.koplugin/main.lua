@@ -182,7 +182,31 @@ function EzVenera:initEngine()
         return false, err
     end
     self:_startEnginePump(engine)
+    -- r10 M2 接好通道、M3 把取结果的 await 改成跨拍等待。**默认仍为关**：
+    -- 真机（2026-09-27 探针 ezvm3）实测一翻开就坏——https 源的 search.load 在
+    -- 77ms 内报 `runtime/asyncnet.lua:109: attempt to yield across C-call
+    -- boundary`，job 协程第一次 resume 就让出不了。本地 tlsfake 全栈测不到这条
+    -- （假 eval 里没有 C 帧），所以只能在真机判。修好之前默认不开，
+    -- 想提前验证就在「设置→开发者选项」式的 KOReader 设置里把
+    -- `ezvenera_async_http` 显式写成 true（探针也是这么钉的）。
+    bridge.async_http = self:_asyncHttpWanted()
+        and self._pump_running == true
+    logger.info("ezvenera: async http channel",
+        bridge.async_http and "ON" or "OFF")
     return true, engine
+end
+
+--- 异步 http 通道要不要开？默认不开（见上：真机 C-call boundary 未修）。
+--- `self.async_http` 非 nil 时按它走（测试/探针钉子），否则读 KOReader 设置。
+function EzVenera:_asyncHttpWanted()
+    if self.async_http ~= nil then return self.async_http == true end
+    local ok, want = pcall(function()
+        local G = G_reader_settings
+        if not (G and G.readSetting) then return false end
+        return G:readSetting("ezvenera_async_http") == true
+    end)
+    if ok then return want == true end
+    return false
 end
 
 --- S2 异步泵（交接文档"下一步唯一关键项"，2026-09-25 落地）：
@@ -207,13 +231,27 @@ function EzVenera:_startEnginePump(engine, interval)
         local ok, err = pcall(function() eng:pump() end)
         if not ok then
             self._pump_running = false
+            -- 泵死了，在飞请求的 Promise 再也不会有人兑现：直接取消，
+            -- 让 socket 当场归还（挂着的 fd 只能等对端超时才回来）
+            pcall(function()
+                if eng.bridge and eng.bridge.abortHttp then
+                    eng.bridge:abortHttp()
+                end
+            end)
             local logger = require("logger")
             if logger and logger.warn then
                 logger.warn("[ezvenera] engine pump stopped:", tostring(err))
             end
             return
         end
-        UIManager:scheduleIn(period, tick)
+        -- 网络在飞时把周期收到 0.05s：一次「等数据」= 一个泵周期，
+        -- 0.5s 的步进会把一次握手拖成好几拍。空闲时回到 0.5s不吃 CPU。
+        -- 调用方显式指定 interval 时保持定值（单测要可预期）。
+        local next_period = period
+        if not interval and eng.busy and eng:busy() then
+            next_period = 0.05
+        end
+        UIManager:scheduleIn(next_period, tick)
     end
     UIManager:scheduleIn(period, tick)
 end

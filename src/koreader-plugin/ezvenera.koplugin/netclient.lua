@@ -26,7 +26,19 @@ EZVenera for KOReader — netclient.lua
 
 响应模型与 Venera 契约对齐：永不抛错，返回
   { status, headers = { 小写键: "v1,v2" }, body, error }
+
+r10 M1（非阻塞传输）：`requestAsync` 把同一条 HTTPS 路径放进 AsyncNet 协程
+作业里跑。io 一路传到 `_tlsConn`，连接/握手/收发在「现在没数据」时 yield 回
+UIManager 节拍，而不是原地干等 4s。要点：
+  - 走的是 luasocket 自己的 HTTP 客户端，**不自写响应解析**（M0 判定）；
+  - 单条作业里每次底层 socket 动作都先 `settimeout(0)`，再靠
+    `AsyncNet.retry` 把 `timeout`/`wantread`/`wantwrite` 变成「等一拍再来」；
+  - 取消 = 丢掉协程 + `_ezv_hard_close` + `_dropTunnel`（半截隧道绝不能留）；
+  - 明文 http（`_plainRequest`）与自定义 transport **不经 create**，仍然是
+    阻塞的——异步化只覆盖 HTTPS 那条真实瓶颈路径。
 ]]
+
+local AsyncNet = require("runtime/asyncnet")
 
 local NetClient = {}
 NetClient.__index = NetClient
@@ -241,9 +253,39 @@ function NetClient.proxyParts(proxy)
     return p
 end
 
+--- 收发（r10 M1）：io 为空 = 原阻塞调用，形状与 luasocket/LuaSec 一致；
+--- io 非空 = 先按非阻塞试一次，`timeout`/`wantread`/`wantwrite` 交给
+--- AsyncNet.retry 等一拍再来。obj 用 sock 本身：真机 LuaSec 的 conn 是
+--- userdata 但带 getfd，而 socket.select 只吃带 getfd 的对象（数字 fd 直接
+--- 抛错，M0 实测），两者同形可用。
+--- 入参形状必须与 luasocket 的 conn 完全一致：`receive()`、`receive(n)`、
+--- `receive("*l", prefix)` 三种真机都会用到（http.lua 的 receivestatusline 就是
+--- 先 `receive(5)` 再 `receive("*l", "HTTP/")`），少转发一个入参状态行就残缺，
+--- luasocket 判「坏状态行」直接抛错。LuaJIT 是 5.1 语义，嵌套闭包里拿不到
+--- `...`，所以逐个显式传。
+local function recv1(sock, pat, prefix)
+    if pat == nil then return sock:receive() end
+    if prefix == nil then return sock:receive(pat) end
+    return sock:receive(pat, prefix)
+end
+
+local function xsend(io, sock, data)
+    if not io then return sock:send(data) end
+    return AsyncNet.retry(io, sock, "write", function() return sock:send(data) end)
+end
+
+local function xrecv(io, sock, pat, prefix)
+    if not io then return recv1(sock, pat, prefix) end
+    return AsyncNet.retry(io, sock, "read",
+        function() return recv1(sock, pat, prefix) end)
+end
+
 --- TLS 包装（cfg 与 LuaSec ssl/https.lua:29-33 一致，verify=none 同上游）。
 --- 失败时不关闭 sock（由调用方统一 close）。
-function NetClient.wrapTLS(libs, sock, host, timeout)
+--- io 非空 = 非阻塞形态（r10 M1）：settimeout(0) 后 dohandshake 会回
+--- wantread/wantwrite，`want("both")` 给出该等哪一侧（M0 真机实测握手可续，
+--- 续上之后同一条连接完成整笔事务）。
+function NetClient.wrapTLS(libs, sock, host, timeout, io)
     if not (libs.ssl and libs.ssl.wrap) then
         return nil, "LuaSec(ssl) 不可用"
     end
@@ -257,6 +299,16 @@ function NetClient.wrapTLS(libs, sock, host, timeout)
         return nil, "ssl.wrap 失败: " .. tostring(tls)
     end
     pcall(function() tls:sni(host) end)
+    if io then
+        pcall(function() tls:settimeout(0) end)
+        local hok, one, herr = AsyncNet.retry(io, tls, "both",
+            function() return tls:dohandshake() end)
+        if not hok then
+            pcall(function() tls:close() end)
+            return nil, "TLS 握手失败: " .. tostring(herr or one)
+        end
+        return tls
+    end
     if timeout then pcall(function() tls:settimeout(timeout) end) end
     local hok, one, herr = pcall(function() return tls:dohandshake() end)
     if not hok or not one then
@@ -267,21 +319,21 @@ function NetClient.wrapTLS(libs, sock, host, timeout)
 end
 
 --- 在已连通的 sock 上完成 CONNECT 握手（明文写；代理自身是 TLS 时由
---- _tlsConn 先包一层再进来）。
-local function sendConnect(sock, host, port, auth)
+--- _tlsConn 先包一层再进来）。io 非空 = 逐次收发都走非阻塞等待。
+local function sendConnect(sock, host, port, auth, io)
     -- IPv6 字面量必须带方括号，否则 CONNECT 行的 host:port 有歧义
     if host:find(":") then host = "[" .. host .. "]" end
     local reqline = "CONNECT " .. host .. ":" .. tostring(port) .. " HTTP/1.0\r\n"
     if auth then
         reqline = reqline .. "Proxy-Authorization: Basic " .. auth .. "\r\n"
     end
-    local sent, serr = sock:send(reqline .. "\r\n")
+    local sent, serr = xsend(io, sock, reqline .. "\r\n")
     if not sent then return nil, "CONNECT 发送失败: " .. tostring(serr) end
-    local line, rerr = sock:receive("*l")
+    local line, rerr = xrecv(io, sock, "*l")
     if not line then return nil, "代理未响应 CONNECT: " .. tostring(rerr) end
     -- 排空响应头（可能带质询/说明行），读到空行为止
     while true do
-        local h, herr = sock:receive("*l")
+        local h, herr = xrecv(io, sock, "*l")
         if not h then return nil, "读取代理响应头失败: " .. tostring(herr) end
         if h == "" then break end
     end
@@ -368,14 +420,23 @@ end
 --- connect 成功后按 LuaSec reg() 的做法把 TLS 对象方法逐个挂上。
 --- pool_key 非空时启用隧道复用：connect 成功后 close 变成"归还入池"，
 --- connect 变成 no-op，下一次同 key 请求直接拿这个 conn 用。
-function NetClient._tlsConn(libs, tgt, proxy, timeout, nc, pool_key, idle_cap)
+--- aio 非空 = 本连接挂在 AsyncNet 作业上（r10 M1）：所有系统调用都改成
+--- 「非阻塞试一次 + 没数据就 yield」。注意 _aio 存在 conn 表上而不是闭包里
+--- ——同一条池化隧道可能被异步作业建立、被同步请求复用（反之亦然），绑死
+--- 会拿着已作废的协程句柄去 yield。
+function NetClient._tlsConn(libs, tgt, proxy, timeout, nc, pool_key, idle_cap, aio)
     return function()
         if not libs.socket then return nil, "socket 不可用" end
         if pool_key and nc then
             local reused = nc:_takeTunnel(pool_key)
-            if reused then return reused end
+            if reused then
+                reused._aio = aio
+                if aio then aio._conn = reused end
+                return reused
+            end
         end
-        local conn = { sock = libs.socket.tcp() }
+        local conn = { sock = libs.socket.tcp(), _aio = aio }
+        if aio then aio._conn = conn end   -- 取消时要能硬关这条 fd（协程已不在手上）
         -- settimeout/close 在 connect 前就会被 luasocket 的 _M.open 调用；
         -- 按当前 sock 的 metatable 动态取（CONNECT 后 sock 可能已是代理 TLS
         -- 对象，用裸 socket 的 C 方法会炸）
@@ -386,11 +447,23 @@ function NetClient._tlsConn(libs, tgt, proxy, timeout, nc, pool_key, idle_cap)
             return f(self.sock, ...)
         end
         conn.settimeout = function(self, ...)
+            if self._aio then return call(self, "settimeout", 0) end
             return call(self, "settimeout", ...)
         end
         conn.close = function(self) return call(self, "close") end
         conn.connect = function(self, c_host, c_port)
-            local ok, err = self.sock:connect(c_host, c_port)
+            local io = self._aio
+            local ok, err
+            if io then
+                -- 必须自己钉 0：luasocket 只在 _M.open 里调一次 settimeout，
+                -- 而 M0 实测「不钉 0 的 connect」就是原地等满超时
+                pcall(function() self.sock:settimeout(0) end)
+                ok, err = AsyncNet.retry(io, self.sock, "write", function()
+                    return self.sock:connect(c_host, c_port)
+                end)
+            else
+                ok, err = self.sock:connect(c_host, c_port)
+            end
             if not ok then
                 self:close()
                 return nil, "连接 " .. tostring(c_host) .. ":" .. tostring(c_port)
@@ -399,7 +472,7 @@ function NetClient._tlsConn(libs, tgt, proxy, timeout, nc, pool_key, idle_cap)
             if proxy then
                 if proxy.scheme == "https" then
                     local pts, perr = NetClient.wrapTLS(libs, self.sock,
-                        proxy.host, timeout)
+                        proxy.host, timeout, io)
                     if not pts then
                         self:close()
                         return nil, perr
@@ -407,14 +480,14 @@ function NetClient._tlsConn(libs, tgt, proxy, timeout, nc, pool_key, idle_cap)
                     self.sock = pts
                 end
                 local cok, cerr = sendConnect(self.sock, tgt.host, tgt.port,
-                    proxy.auth)
+                    proxy.auth, io)
                 if not cok then
                     self:close()
                     return nil, cerr
                 end
             end
             local tls, terr = NetClient.wrapTLS(libs, self.sock, tgt.host,
-                timeout)
+                timeout, io)
             if not tls then
                 self:close()
                 return nil, terr
@@ -428,6 +501,25 @@ function NetClient._tlsConn(libs, tgt, proxy, timeout, nc, pool_key, idle_cap)
                     end
                 end
             end
+            -- 拷贝完再包一层收发：luasocket 的 http 客户端在此之后只会通过
+            -- conn:send / conn:receive 碰网络，所以这两个口子就是全部阻塞点
+            local method_send, method_recv = conn.send, conn.receive
+            -- send 只有一个入参（http.lua 全部是 `c:send(str)`）；receive 必须
+            -- 原样保住 (pattern, prefix) 两个形状，见 recv1 的注释。
+            conn.send = function(self2, data)
+                if not self2._aio then return method_send(self2, data) end
+                return AsyncNet.retry(self2._aio, self2.sock, "write",
+                    function() return method_send(self2, data) end)
+            end
+            conn.receive = function(self2, pat, prefix)
+                local function go()
+                    if pat == nil then return method_recv(self2) end
+                    if prefix == nil then return method_recv(self2, pat) end
+                    return method_recv(self2, pat, prefix)
+                end
+                if not self2._aio then return go() end
+                return AsyncNet.retry(self2._aio, self2.sock, "read", go)
+            end
             if pool_key and nc then
                 -- 上面的方法拷贝会覆盖 conn.close / conn.settimeout，所以
                 -- 池化包装必须放在它之后。connect 置 no-op：重复 CONNECT 会
@@ -436,16 +528,20 @@ function NetClient._tlsConn(libs, tgt, proxy, timeout, nc, pool_key, idle_cap)
                 conn.connect = function() return 1 end
                 local raw_settimeout = conn.settimeout
                 conn.settimeout = function(self2, t)
-                    -- 复用请求的阻塞超时收紧：隧道可能被代理悄悄回收，而
-                    -- luasocket 的 _M.open 会按 http.TIMEOUT（60s）设值，
-                    -- 干等会把 UI 冻住。新建隧道不受影响。
-                    if idle_cap and type(t) == "number" and t > idle_cap then
+                    -- 异步作业一律非阻塞；复用请求的阻塞超时收紧：隧道可能被
+                    -- 代理悄悄回收，而 luasocket 的 _M.open 会按 http.TIMEOUT
+                    -- （60s）设值，干等会把 UI 冻住。新建隧道不受影响。
+                    if self2._aio then t = 0
+                    elseif idle_cap and type(t) == "number" and t > idle_cap then
                         t = idle_cap
                     end
                     return raw_settimeout(self2, t)
                 end
                 conn.close = function(self2)
                     if self2._ezv_parked then return 1 end
+                    -- 入池即与本作业的协程解绑：下一条请求（同步或异步）
+                    -- 自己认领 _aio，否则池里的连接会对着死协程 yield
+                    self2._aio = nil
                     nc:_parkTunnel(pool_key, self2)
                     return 1
                 end
@@ -542,7 +638,7 @@ function NetClient:_httpsRequest(opts, method, headers, proxy, source)
                 -- 自动跳转不可用（tredirect 复用绑定旧目标的 create）
                 redirect = false,
                 create = NetClient._tlsConn(libs, tgt, pp, timeout, self, key,
-                    idle_cap),
+                    idle_cap, opts.aio),
             }
             if pp then reqt.proxy = pp.url end
             if cur_source then reqt.source = cur_source end
@@ -697,6 +793,72 @@ function NetClient:_plainRequest(opts, method, headers, proxy, parts, source)
     end
     return { status = tonumber(code), headers = normalizeHeaders(resheaders),
              body = table.concat(parts) }
+end
+
+--- ---------- r10 M1：非阻塞请求入口 ----------
+
+--- 惰性建 AsyncNet 单例（每个 NetClient 一份，全局节拍一份即可）。
+--- 上限 2 条在飞：低配设备上并发带来的内存/代理压力没有实测数据。
+function NetClient:_asyncnet()
+    if self._anet then return self._anet end
+    if not AsyncNet then return nil, "runtime/asyncnet 不可用" end
+    local libs = self:_libs()
+    if not (libs.socket and type(libs.socket.select) == "function") then
+        return nil, "socket.select 不可用（非阻塞传输需要它）"
+    end
+    local socket = libs.socket
+    self._anet = AsyncNet.new{
+        max_inflight = self.async_max_inflight or 2,
+        -- 单次系统调用的等待上限沿用 block 超时：语义与同步路径一致，
+        -- 差别只在于等待期间 UI 拿得到事件
+        wait_sec = self.default_timeout_block,
+        now = function() return socket.gettime() end,
+        select = function(rs, ws, t) return socket.select(rs, ws, t) end,
+    }
+    return self._anet
+end
+
+--- 一拍：推进所有在飞请求。由上层泵（JsHost:pump / UIManager 节拍）调用。
+function NetClient:tickAsync(budget_sec)
+    if not self._anet then return nil end
+    return self._anet:tick(budget_sec or self.async_slice_sec)
+end
+
+--- 在飞 + 排队的非阻塞任务数。0 表示泵可以回到慢周期（M2 的判据）。
+function NetClient:asyncPending()
+    if not self._anet then return 0 end
+    return self._anet:pending()
+end
+--- 非阻塞 HTTPS 请求。与 request() 同一条代码路径，只是跑在协程里。
+--- on_done(ok, resp)：resp 恒为表，形状与 request() 一致（{status,headers,
+--- body} 或 {error}）。返回 job（job:cancel() 即取消），失败返回 nil, err。
+--- 已知边界：scheme=http 与自定义 transport 不经 create，仍然是阻塞的。
+function NetClient:requestAsync(opts, on_done)
+    local anet, aerr = self:_asyncnet()
+    if not anet then return nil, aerr end
+    local o2 = {}
+    for k, v in pairs(opts or {}) do o2[k] = v end
+    local job
+    job = anet:submit(function(io)
+        o2.aio = io
+        local r = self:request(o2)
+        if type(r) ~= "table" then return nil, "netclient: 空响应" end
+        if r.error then return false, r end
+        return r
+    end, function(ok, resp)
+        if on_done then on_done(ok, resp) end
+    end)
+    job.cleanup = function()
+        local c = job.io._conn
+        if not c then return end
+        c._aio = nil                      -- 协程不再持有这条连接
+        if c._ezv_hard_close then
+            pcall(function() c:_ezv_hard_close() end)
+        else
+            pcall(function() c:close() end)
+        end
+    end
+    return job
 end
 
 return NetClient

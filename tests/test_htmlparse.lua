@@ -30,6 +30,11 @@ local function newDocEngine(html)
     return eng
 end
 
+local function assert_eq_count(label, expected, actual)
+    assert(expected == actual, label .. ": expected " .. tostring(expected)
+        .. " matches, got " .. tostring(actual))
+end
+
 function tests.parse_and_query_selector()
     local eng = newDocEngine(SAMPLE)
     local k = eng:handle({ ["function"] = "querySelector", key = 1,
@@ -72,6 +77,104 @@ function tests.attribute_value_selector()
     assert(k, "attr=value selector should match")
     local txt = eng:handle({ ["function"] = "getText", key = k, doc = 1 })
     assert(txt == "Gamma", "text should be Gamma, got " .. tostring(txt))
+    return true
+end
+
+-- ---------- 属性选择子全集（2026-09-26 真机：豆包漫画搜索/分类"不可用"） ----------
+-- 旧实现只认 `[a=v]`：`class*=` 被当成名为 `class*` 的属性 → 恒 nil → 恒不匹配，
+-- 而且**不报错**。logcat 里 HTTP 200 / html parse / querySelectorAll 都在，
+-- 就是列表空。装机 20 源共 29 处 `*=`/`^=` 受同一影响。
+
+-- 逐节点照抄真机页面（list-area-guonei.html 抓取于 2026-09-26）：
+-- li 里 `div.pic > a > div.img-wrapper[data-original]`，标题又在 `div.name > h3 > a`
+-- 重复一次，所以一个条目有 2~3 个受同一选择子命中的节点。
+local ATTR_SAMPLE = [[
+<ul class="row comic-list">
+  <li class="col-xs-4 col-md-3 col-lg-2" data-id="7">
+    <div class="pic">
+      <a href="/detail/ab12.html" title="人间百里锦"><div class="img-wrapper lazy img-wrapper-pic" data-original="https://img.example.com/cover/ab12.webp"></div></a>
+    </div>
+    <div class="name">
+      <h3><a href="/detail/ab12.html" title="人间百里锦">人间百里锦</a></h3>
+      <p class="item-status text-overflow">小番外</p>
+    </div>
+  </li>
+  <li class="col-xs-4">
+    <div class="pic">
+      <a href="/detail/cd34.html" lang="zh-CN"><img data-original="c2.webp"></a>
+    </div>
+  </li>
+  <li class="plain"><span>no link</span></li>
+</ul>
+]]
+
+local function countAll(eng, q)
+    local ks = eng:handle({ ["function"] = "querySelectorAll", key = 1, query = q })
+    return type(ks) == "table" and #ks or -1
+end
+
+function tests.attribute_operators_substring_prefix_suffix()
+    local eng = newDocEngine(ATTR_SAMPLE)
+    -- 豆包里那一条原样选择子（值裸写、带连字符）
+    assert_eq_count("class*=", 2, countAll(eng, "li[class*=col-]"))
+    assert_eq_count("class*= quoted", 2, countAll(eng, 'li[class*="col-"]'))
+    assert_eq_count("href^=", 3, countAll(eng, 'a[href^="/detail/"]'))
+    assert_eq_count("href$=", 3, countAll(eng, 'a[href$=".html"]'))
+    assert_eq_count("presence", 3, countAll(eng, "a[href]"))
+    assert_eq_count("no match", 0, countAll(eng, "li[class*=zzz]"))
+    return true
+end
+
+function tests.attribute_operators_word_and_prefix_dash()
+    local eng = newDocEngine(ATTR_SAMPLE)
+    -- ~=：按空白分词的整词匹配（`col-xs-4` 不是词 `col`）
+    assert_eq_count("class~=col-xs-4", 2, countAll(eng, 'li[class~="col-xs-4"]'))
+    assert_eq_count("class~=col", 0, countAll(eng, 'li[class~="col"]'))
+    -- |=：整值相等或以「值-」开头
+    assert_eq_count("lang|=zh", 1, countAll(eng, 'a[lang|="zh"]'))
+    assert_eq_count("lang|=zh-CN", 1, countAll(eng, 'a[lang|="zh-CN"]'))
+    assert_eq_count("lang|=en", 0, countAll(eng, 'a[lang|="en"]'))
+    return true
+end
+
+function tests.attribute_value_may_contain_dot_and_hash()
+    -- 复合选择器切分必须整段吃掉 `[...]`：值里的 `.` 曾被当成语义分隔符，
+    -- `[href*=".html"]` 被劈成 `[href*="` + `.html` + `"]` → 恒 0 命中
+    local eng = newDocEngine(ATTR_SAMPLE)
+    assert_eq_count("dot inside value", 3, countAll(eng, "a[href*=\".html\"]"))
+    assert_eq_count("tag + bracket + class", 1,
+        countAll(eng, "li.col-xs-4[data-id=\"7\"]"))
+    return true
+end
+
+function tests.child_combinator_applies_to_its_own_part()
+    -- `ul > li p`：`>` 只约束 li 必须是 ul 的子元素，p 仍是后代。
+    -- 旧扫描把 child 标记错位一格（按 li、p 的顺序变成「p 是 li 的子元素」），
+    -- 于是这种写法静默 0 命中。
+    local eng = newDocEngine(
+        '<ul><li class="a"><div><p>x</p></div></li></ul>')
+    assert_eq_count("ul > li p", 1, countAll(eng, "ul > li p"))
+    assert_eq_count("ul > li > div > p", 1, countAll(eng, "ul > li > div > p"))
+    -- p 是 div 的子元素、不是 li 的 → 这条必须 0 命中（旧写法当成后代，1 命中）
+    assert_eq_count("ul li > p", 0, countAll(eng, "ul li > p"))
+    return true
+end
+
+function tests.doubao_list_page_selectors_match_real_markup()
+    -- 豆包漫画 parseListPage/排行的原样选择子（真机 2026-09-26：HTTP 200 之后
+    -- querySelectorAll 空命中 → 搜索与分类全是空列表）
+    local eng = newDocEngine(ATTR_SAMPLE)
+    assert_eq_count("li[class*=col-]", 2, countAll(eng, "li[class*=col-]"))
+    assert_eq_count("div.pic a", 2, countAll(eng, "div.pic a"))
+    assert_eq_count("a[href*=detail]", 3, countAll(eng, "a[href*=detail]"))
+    assert_eq_count("[data-original]", 2, countAll(eng, "[data-original]"))
+    -- 命中项的属性确实读得到（源里靠 href 正则取 id）
+    local ks = eng:handle({ ["function"] = "querySelectorAll", key = 1,
+        query = "a[href*=detail]" })
+    local attrs = eng:handle({ ["function"] = "getAttributes", key = ks[1],
+        doc = 1 })
+    assert(attrs.href == "/detail/ab12.html",
+        "first href should be /detail/ab12.html, got " .. tostring(attrs.href))
     return true
 end
 

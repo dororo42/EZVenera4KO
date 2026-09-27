@@ -14,7 +14,11 @@ JS 源只负责给出 images URL 列表；本移植的 HTTP 通道是 netclient�
   一个依赖，也让单测无需伪造 JSON 编码器（中文标题按字节原样存）。
 
 文件系统通过 deps.fs 注入，真实实现见 Downloader.makeFs()；单测给内存表实现，
-这样命名/续传/取消清理/manifest 解析等逻辑都能在纯 LuaJIT 环境里验证。
+这样命名/续传/取消留半截/manifest 解析等逻辑都能在纯 LuaJIT 环境里验证。
+
+取消与失败的处置是「留字节」而不是「删字节」：完整 manifest 只在最后一页之后才
+写，中途停下的目录写一份 complete=0 的 manifest，下次 begin 校验 URL 逐位相同就
+从那页继续（弱网/流量场景下，重下一整章的代价由用户承担）。
 ]]
 
 local Downloader = {}
@@ -171,7 +175,11 @@ function Downloader.encodeManifest(m)
         "key\t" .. esc(m.key), "comic\t" .. esc(m.comicId),
         "ep\t" .. esc(m.epId), "comic_title\t" .. esc(m.comicTitle),
         "chapter_title\t" .. esc(m.chapterTitle),
-        "saved\t" .. esc(m.saved), "pages\t" .. esc(#m.pages) }
+        "saved\t" .. esc(m.saved),
+        -- 未完成的章留着字节等续传，靠这一行和「已下载」区分开。
+        -- 缺行 = 完整（本次改动之前写下的 manifest 都没有这行）。
+        "complete\t" .. (m.complete == false and "0" or "1"),
+        "pages\t" .. esc(#m.pages) }
     for i, p in ipairs(m.pages) do
         lines[#lines + 1] = ("page\t%s\t%s\t%s"):format(
             esc(p.file), esc(p.bytes), esc(p.url))
@@ -192,6 +200,7 @@ function Downloader.decodeManifest(text)
         elseif k == "comic_title" then m.comicTitle = unesc(rest)
         elseif k == "chapter_title" then m.chapterTitle = unesc(rest)
         elseif k == "saved" then m.saved = tonumber(rest)
+        elseif k == "complete" then m.complete = rest ~= "0"
         elseif k == "page" then
             local file, bytes, url = rest:match("^([^\t]*)\t([^\t]*)\t(.*)$")
             if file then
@@ -205,10 +214,11 @@ function Downloader.decodeManifest(text)
     return m
 end
 
---- 读 manifest 并校验页文件是否都在（缺文件 = 不完整，不能当离线章用）。
-function Downloader:manifestOf(key, comicId, epId)
+--- 目录里的 manifest（完整与未完成都返回）。
+function Downloader:_manifestIn(key, comicId, epId)
     local dir = self:dirOf(key, comicId, epId)
-    local m = Downloader.decodeManifest(self.fs.read(Downloader.manifestPath(dir)))
+    local m = Downloader.decodeManifest(
+        self.fs.read(Downloader.manifestPath(dir)))
     if not m then return nil end
     local bytes = 0
     for _, p in ipairs(m.pages) do
@@ -220,6 +230,21 @@ function Downloader:manifestOf(key, comicId, epId)
     m.key = m.key or key
     m.comicId = m.comicId or comicId
     m.epId = m.epId or epId
+    return m
+end
+
+--- 读 manifest 并校验页文件是否都在（缺文件 = 不完整，不能当离线章用）。
+--- 未完成（complete=0）的目录**不算已下载**：离线阅读与「已下载」标记只认完整章。
+function Downloader:manifestOf(key, comicId, epId)
+    local m = self:_manifestIn(key, comicId, epId)
+    if not m or m.complete == false then return nil end
+    return m
+end
+
+--- 未完成的下载（取消或某页失败留下的前半截），页文件齐才返回。
+function Downloader:partialOf(key, comicId, epId)
+    local m = self:_manifestIn(key, comicId, epId)
+    if not m or m.complete ~= false then return nil end
     return m
 end
 
@@ -236,6 +261,17 @@ end
 ---   images = { "url" | {url=, headers=} , ... }（Venera 两种形态都吃）
 ---   base_headers = 源 onImageLoad 给的公共头
 ---   on_progress = fn(done, total)；返回 false 即请求取消
+--- 续传的硬条件：前半截每页的 URL 与本轮 images 逐位相同。签名型图床（URL 带
+--- token）重取列表后必然变串，这时不复用——宁可重下，也不能把第 3 页的文件
+--- 配到第 5 页的地址上。
+function Downloader:_pagesResumable(part, images)
+    for i, p in ipairs(part.pages) do
+        local url = (type(images[i]) == "table") and images[i].url or images[i]
+        if url ~= p.url then return false end
+    end
+    return true
+end
+
 function Downloader:begin(o)
     if not self.request then return nil, "no request channel" end
     local key, comicId, epId = o.key, o.comicId, o.epId
@@ -251,29 +287,52 @@ function Downloader:begin(o)
     end
     local dir = self:dirOf(key, comicId, epId)
     if not self.fs.mkdir(dir) then return nil, "无法创建目录: " .. dir end
-    -- 上一轮中断的残留（含坏 manifest）先清干净：manifest 最后才写，所以
-    -- 此刻目录里的任何东西都不能给离线阅读当"已下载"用。
-    local stale = self.fs.list(dir)
-    if stale then
-        for _, name in ipairs(stale) do self.fs.remove(dir .. "/" .. name) end
+    local pages, done, bytes = {}, 0, 0
+    local part = self:partialOf(key, comicId, epId)
+    if part and self:_pagesResumable(part, images) then
+        pages, done = part.pages, #part.pages
+        for _, p in ipairs(pages) do bytes = bytes + (p.bytes or 0) end
+    else
+        -- 不能续就把目录清干净（含坏 manifest）：完整 manifest 最后才写，
+        -- 目录里来路不明的文件不能让离线阅读当成"已下载"。
+        local stale = self.fs.list(dir)
+        if stale then
+            for _, name in ipairs(stale) do self.fs.remove(dir .. "/" .. name) end
+        end
     end
     return {
         o = o, key = key, comicId = comicId, epId = epId, dir = dir,
-        images = images, total = #images, done = 0, pages = {}, bytes = 0,
+        images = images, total = #images, done = done, pages = pages,
+        bytes = bytes, resumed = done,
     }
+end
+
+--- 落一份「未完成」manifest：已下页的字节留着，下次 begin 从这里续。
+--- 一页都没落成就没有留的价值，直接清目录。
+function Downloader:_leavePartial(job)
+    if #job.pages == 0 then
+        self:remove(job.key, job.comicId, job.epId)
+        return
+    end
+    self.fs.write(Downloader.manifestPath(job.dir), Downloader.encodeManifest{
+        key = job.key, comicId = job.comicId, epId = job.epId,
+        comicTitle = job.o.comicTitle, chapterTitle = job.o.chapterTitle,
+        saved = os.time(), pages = job.pages, complete = false,
+    })
 end
 
 --- 取一页并落盘。返回 ("run", done) 还有页要下 / ("done", manifest) /
 --- ("error", err)。取消在这里生效：调用方置 job.stopped，或 on_progress 返回 false。
+--- 取消与失败都保留已下页（complete=0），不删字节。
 function Downloader:step(job)
     if job.skipped then return "done", job.manifest end
     local o = job.o
     if job.stopped then
-        self:remove(job.key, job.comicId, job.epId)
+        self:_leavePartial(job)
         return "error", "已取消"
     end
     local fail = function(msg)
-        self:remove(job.key, job.comicId, job.epId)
+        self:_leavePartial(job)
         return "error", msg
     end
 
@@ -325,7 +384,7 @@ function Downloader:step(job)
         job.stopped = true
     end
     if job.stopped then
-        self:remove(job.key, job.comicId, job.epId)
+        self:_leavePartial(job)
         return "error", "已取消"
     end
     if i < job.total then return "run", i end
@@ -364,9 +423,10 @@ function Downloader:remove(key, comicId, epId)
     return true
 end
 
---- 已下载章节列表（按 manifest 的 saved 倒序）。dir 里没有 manifest 的一律
---- 跳过（中断的残留），并顺手删掉，避免占着空间又读不出来。
-function Downloader:list()
+--- 按 manifest 的 complete 位扫描下载目录。want_complete=true 取完整章（可离线
+--- 阅读、计入体积），false 取未完成章（只能续传或删除）。
+--- 页文件缺失的一律清掉：完整章缺页 = 损坏，未完成缺页 = 没法续，留着只会占空间。
+function Downloader:_scan(want_complete)
     local dirs = self.fs.list(self.basedir) or {}
     local rows = {}
     for _, name in ipairs(dirs) do
@@ -380,11 +440,11 @@ function Downloader:list()
                 if not self.fs.exists(dir .. "/" .. p.file) then ok = false break end
                 m.bytes = m.bytes + (p.bytes or 0)
             end
-            if ok then
+            if not ok then
+                self:_prune(dir)
+            elseif (m.complete ~= false) == want_complete then
                 m.dir = dir
                 rows[#rows + 1] = m
-            else
-                self:_prune(dir)
             end
         elseif self.fs.list(dir) then
             self:_prune(dir)
@@ -394,16 +454,29 @@ function Downloader:list()
     return rows
 end
 
+--- 已下载（完整）章节列表，按 saved 倒序。未完成的不在这里出现，也不能当离线章。
+function Downloader:list()
+    return self:_scan(true)
+end
+
+--- 未完成（取消或失败中断）的章节：留着字节等续传，界面里给单独的删除入口。
+function Downloader:listPartials()
+    return self:_scan(false)
+end
+
 function Downloader:_prune(dir)
     local names = self.fs.list(dir) or {}
     for _, name in ipairs(names) do self.fs.remove(dir .. "/" .. name) end
     self.fs.remove(dir)
 end
 
+--- 清空全部下载：完整章与未完成章（留着等续传的半截）一起走，返回删除条数。
 function Downloader:clearAll()
     local rows = self:list()
     for _, m in ipairs(rows) do self:_prune(m.dir) end
-    return #rows
+    local parts = self:listPartials()
+    for _, m in ipairs(parts) do self:_prune(m.dir) end
+    return #rows + #parts
 end
 
 --- 已下载章节占用的字节数（按 manifest 记录的页字节求和）。
