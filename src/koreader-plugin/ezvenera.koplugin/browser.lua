@@ -38,8 +38,10 @@ function Browser.new(deps)
     o.sourcedata = deps.sourcedata
     -- 阅读页字节缓存预算（可调，默认见 showReader）
     o.page_cache_bytes = deps.page_cache_bytes
-    -- 解码后 BlitBuffer 的内存预算（一页 ≈ 宽×高×通道，Android 内存紧张）
+    -- 解码后 BlitBuffer 的内存预算（一页 = stride×高，webp/GIF 是 RGB32 比
+    -- JPEG 的 RGB24 大一档，Android 内存紧张）+ 最少常驻页数（逐出的硬下限）
     o.page_bb_bytes = deps.page_bb_bytes
+    o.page_bb_min_pages = deps.page_bb_min_pages
     -- 离线下载根目录（单测注入临时目录；真机走 DataStorage）
     o.downloads_dir = deps.downloads_dir
     -- 「另存本页」的落盘根目录（同一套注入方式，见 savedBasedir）
@@ -1984,6 +1986,94 @@ function Browser:_hookLongPressSave(viewer, on_save)
     return true
 end
 
+-- ---------- 页图原始尺寸（只读头部，一个像素都不解码） ----------
+-- 【#72 A】阅读器要不要降采样，必须在**解码之前**判：上游 TurboJPEG/libwebp/
+-- giflib 三条分支都是先按原生尺寸全解、再 scaleBlitBuffer（真机实测：6 页
+-- 1600 宽 jpeg 的 RSS 增量与 BB 字节几乎 1:1，峰值不动、只动驻留）。所以
+-- 「先解出来看宽高再决定」等于把要省的那笔钱先花掉。
+-- 覆盖真机 13 源实际发出的四种容器；判不出来返回 nil ⇒ 原样原生解码。
+local function imgBe16(s, i) return s:byte(i) * 256 + s:byte(i + 1) end
+local function imgLe16(s, i) return s:byte(i) + s:byte(i + 1) * 256 end
+local function imgLe32(s, i)
+    return s:byte(i) + s:byte(i + 1) * 256 + s:byte(i + 2) * 65536
+        + s:byte(i + 3) * 16777216
+end
+local function imgLe24(s, i)
+    return s:byte(i) + s:byte(i + 1) * 256 + s:byte(i + 2) * 65536
+end
+
+local function jpegDims(data)
+    -- 段结构：FF <标记> <长度:2> <载荷>。SOFn（C0..CF，除 C4/C8/CC）里
+    -- 高在前、宽在后；熵数据里会出现伪 0xFF，所以失配时只前进一字节。
+    local i, n = 2, #data
+    while i + 8 <= n do
+        if data:byte(i) ~= 0xFF then
+            i = i + 1
+        else
+            local m = data:byte(i + 1)
+            if m == 0xFF then
+                i = i + 1                           -- 填充
+            elseif m == 0x01 or (m >= 0xD0 and m <= 0xD7) then
+                i = i + 2                           -- 无长度段的独立标记
+            elseif m >= 0xC0 and m <= 0xCF and m ~= 0xC4 and m ~= 0xC8
+                and m ~= 0xCC then
+                return imgBe16(data, i + 7), imgBe16(data, i + 5)
+            else
+                local len = imgBe16(data, i + 2)
+                if len < 2 then return end
+                i = i + 2 + len
+            end
+        end
+    end
+end
+
+local function webpDims(data)
+    if data:sub(1, 4) ~= "RIFF" or data:sub(9, 12) ~= "WEBP" then return end
+    -- 块从第 13 字节起（1..4 RIFF / 5..8 文件长 / 9..12 WEBP）
+    local i, n = 13, #data
+    while i + 8 <= n do
+        local fourcc = data:sub(i, i + 3)
+        local size = imgLe32(data, i + 4)
+        local p = i + 8                             -- 载荷起点
+        if fourcc == "VP8 " and p + 9 <= n then
+            -- 简单格式：3 字节帧标志 + 9D 01 2A 同步码，之后宽/高各 14 位
+            return (data:byte(p + 6) + (data:byte(p + 7) % 64) * 256),
+                (data:byte(p + 8) + (data:byte(p + 9) % 64) * 256)
+        elseif fourcc == "VP8L" and p + 4 <= n and data:byte(p) == 0xFF then
+            local v = imgLe32(data, p + 1)
+            return (v % 16384) + 1, ((v - v % 16384) / 16384) % 16384 + 1
+        elseif fourcc == "VP8X" and p + 9 <= n then
+            -- 扩展格式（动图走这一支）：1 标志 + 3 保留 + 画布宽高各减一
+            return imgLe24(data, p + 4) + 1, imgLe24(data, p + 7) + 1
+        end
+        if size <= 0 then return end
+        i = i + 8 + size + (size % 2)               -- 块按偶数对齐
+    end
+end
+
+--- 页图原始宽高；任何不确定的形状都返回 nil（宁可不解采样，不猜尺寸）。
+function Browser:imageDims(data)
+    if type(data) ~= "string" or #data < 16 then return end
+    local w, h
+    local head = data:sub(1, 3)
+    if head == "\xFF\xD8\xFF" then
+        w, h = jpegDims(data)
+    elseif head == "GIF" and (data:sub(4, 6) == "87a" or data:sub(4, 6) == "89a") then
+        w, h = imgLe16(data, 7), imgLe16(data, 9)
+    elseif head == "RIF" then
+        w, h = webpDims(data)
+    elseif data:sub(1, 8) == "\x89PNG\r\n\x1a\n" then
+        if data:sub(13, 16) == "IHDR" then
+            w = imgBe16(data, 17) * 65536 + imgBe16(data, 19)
+            h = imgBe16(data, 21) * 65536 + imgBe16(data, 23)
+        end
+    end
+    -- 尺寸必须是「能用的正数」：头部被截断/畸形时按 nil 处理。
+    if w and h and w > 0 and h > 0 and w < 32768 and h < 32768 then
+        return w, h
+    end
+end
+
 --- 打开一章。页表来源两条路：已下载 → 完全离线；否则取源方法（可能跨拍）。
 --- 取完才进 `_openReader`——那 600 行阅读器闭包与页表来源无关，搬进续体会把
 --- 一次真机验证过的整体结构搅碎，所以按参数交接、正文一字不动。
@@ -2051,6 +2141,20 @@ function Browser:_openReader(key, comicId, epId, title, chapterTitle,
     -- 占位 BB 现在可以复用同一个对象：页级 image_disposable=false 之后
     -- viewer 不再 free 我们给它的任何 BB（见 page_table 注释）。
     local placeholder_bb = nil
+    -- 面板宽（懒取一次）：降采样判据用。取不到设备就退回 600 —— 与占位页
+    -- 同一口径，宁可不缩放也不要把宽图钉成一个猜出来的尺寸。
+    local panel_w
+    local function panelWidth()
+        if not panel_w then
+            local okd, Device = pcall(require, "device")
+            if okd and Device and Device.screen then
+                panel_w = tonumber(Device.screen:getWidth()) or 600
+            else
+                panel_w = 600
+            end
+        end
+        return panel_w
+    end
     local function placeholderPage()
         if placeholder_bb then return placeholder_bb end
         local ok, bb = pcall(function()
@@ -2089,9 +2193,18 @@ function Browser:_openReader(key, comicId, epId, title, chapterTitle,
     local cache_order = {}        -- 插入序，按字节预算逐出（页序单调 → 最前先弃）
     local cache_bytes = 0
     local CACHE_BUDGET = self.page_cache_bytes or (24 * 1024 * 1024)
-    -- 解码后的 BB 单独计预算：一页 640x500 RGB32 ≈ 1.28MB，回翻不再重解码。
+    -- 解码后的 BB 单独计预算：回翻不再重解码。
+    -- 【#72 B 2026-09-28 真机】同一形状的页在不同画质档下字节差一档：webp/GIF
+    -- 解成 RGB32（4B/px），jpeg 解成 RGB24（3B/px）——真机实测 800x1137 的 webp
+    -- 页 3.64MB、1115x1600 的 jpeg 页 5.10MB、同样 1115x1600 若是 webp 就是
+    -- 7.14MB。固定 12MB 上限对最后这种只留得下 1 页，逐出会把上一页也吐掉，
+    -- 回翻必重解。所以逐出有两条线：字节上限（软）+ 最少常驻页数（硬）。
+    -- 驻留因此有界于 max(BB_BUDGET, BB_MIN_PAGES × 最大单页字节)。
+    -- 真机口径（三章实测）：字节数 ≤6MB 的页由字节线说了算，这条硬下限不 binding；
+    -- 它只在大页（>6MB）时兜住「只剩 1 页」的形状。
     local bb_order, bb_bytes = {}, 0
     local BB_BUDGET = self.page_bb_bytes or (12 * 1024 * 1024)
+    local BB_MIN_PAGES = self.page_bb_min_pages or 2
     local closed = false
     -- 进度条跳页时置位：目标页没缓存就先把这一屏让给占位页 + 预取节拍，
     -- 不在手势回调里同步下载（一次最坏 6s，连着拖几下必踩安卓 5s ANR）。
@@ -2552,8 +2665,22 @@ function Browser:_openReader(key, comicId, epId, title, chapterTitle,
         end
         local entry = cache[pn]
         if entry and entry.bb then return entry.bb end
+        -- 【#72 A】页比面板宽才降采样：真实页宽 800~1115 < 面板 1200 时
+        -- 「clamp 到面板宽」是空操作（真机三档实测：耗时与字节全同），只对
+        -- 宽图有意义（1600 宽 6 页驻留 66.2→37.3MB）。尺寸只读头部拿
+        -- （见 imageDims），拿不到就原样解码。
+        -- 宽高必须成对传：上游 scaleBlitBuffer 缺任一入参就直接不缩放
+        -- （renderimage.lua `if not width or not height then return bb end`）。
+        -- 代价说清楚：交给 ImageViewer 的是表不是函数，上游 _scaled_image_func
+        -- 不启用 ⇒ 放大到超过面板宽会糊，所以只按面板宽、不钉 800。
+        local req_w, req_h
+        local nw, nh = self:imageDims(data)
+        if nw and nw > panelWidth() then
+            req_w = panelWidth()
+            req_h = math.floor(nh * req_w / nw + 0.5)
+        end
         local okr, bb = pcall(function()
-            return RenderImage:renderImageData(data, #data, false)
+            return RenderImage:renderImageData(data, #data, false, req_w, req_h)
         end)
         if not okr or not bb then
             -- 【R7 真机】下载成功但解不出图：多半是反爬/登录页的 HTML。
@@ -2573,7 +2700,8 @@ function Browser:_openReader(key, comicId, epId, title, chapterTitle,
             -- attempts 上限：保护页会被排回队尾，没有上限时「剩下的全是保护页」
             -- 会让这个循环转不停。
             local attempts = #bb_order
-            while bb_bytes > BB_BUDGET and #bb_order > 1 and attempts > 0 do
+            while bb_bytes > BB_BUDGET and #bb_order > BB_MIN_PAGES
+                and attempts > 0 do
                 attempts = attempts - 1
                 local old = table.remove(bb_order, 1)
                 local entry = cache[old]

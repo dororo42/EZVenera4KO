@@ -121,6 +121,7 @@ src/koreader-plugin/remoteinput.koplugin/  ← 【已删除 2026-09-22】原扫�
 ### ADR-006 页图显示 = ImageViewer 图像列表 + 惰性 metatable + dithered 全刷
 - 理由：复用 KOReader 现成非触屏键位/缩放/进度条；opdspse 是仓库内验证过的范式。
 - 后果：依赖 renderimage/mupdf 路径；WebP 由 mupdf 覆盖（AC 待真机验证 webp 源）。
+  **【真机核销 2026-09-27，安卓平板 KOReader v2026.07.1，tasks.md「T26/T27 真机实测」】WebP/GIF 全部解得开，本 ADR 的显示路径成立；但覆盖关系与原文不同：`renderImageData` 先按魔数分派（`RIFF`→libwebp、`GIF8`→giflib、`0xFFD8`→TurboJPEG），MuPDF 只是**兜底**——它对静态 webp 能解（还比 libwebp 省 1/3 内存，因为回 RGB24），对**动图 webp 直接返回 nil**。副作用要记一笔：webp/GIF 回来的 BB 是 RGB32（4 字节/像素），jpeg 是 RGB24（3 字节）⇒ 同尺寸页图驻留多 1/3，会影响按字节预算的 BB 缓存。**
 
 ### ADR-007 扫码远程输入 = 独立插件 + 弱依赖接入（而非集成进 EZVenera）
 > **【SUPERSEDED 2026-09-22】** 用户决策：扫码远程输入**整体删除**（取代本 ADR 的拆仓方案）。

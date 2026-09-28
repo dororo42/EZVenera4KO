@@ -3,6 +3,7 @@
 ## 元数据
 
 - Created: 2026-09-27 16:50
+- Updated: 2026-09-28 —— #72/T26 降采样解码落地（方案 A+B）后对齐「待办」段与本条；此刻源仓 HEAD = `0ab4212`（`de437a7` 代码 + `ff88f05`/`0ab4212` 文档），公开 `main` 仍是 `2ec26cc`（r9），闸门基线由 457 → **461**。下面「元数据」里的 Created 行是写作当时的 HEAD，不再等值。
 - Source agent: Qoder 主 agent（本轮 = A/B 对照实验结案 + 阅读器内存修复 + r9/r10 收口会话）
 - Project: <项目根>（本文件按仓库脱敏口径书写，不含本机绝对路径 / 局域网地址 / 凭据）
 - Branch: main，HEAD: 78838c7（工作树干净，无未提交项）
@@ -15,7 +16,7 @@
 
 ## 当前状态摘要（一段话版）
 
-**功能面**：安卓平板 13 源装机全链路可用（源列表/主页/分类/详情/章节/阅读/前后章/下载/缓存/离线/收藏/历史/搜索/引擎状态），搜索与分类的「不可用」真因是 `htmlparse.lua` 的 CSS 属性选择子只实现 `[a=v]` 一种形状（恒 0 命中且不报错），已补齐运算符全集并真机端到端取证。**离线下载**已改成取消/失败保留字节 + 断点续传（manifest 加 `complete` 位），未完成章由 `listPartials()` 在缓存界面单独列出。**内存**：阅读器逐出解码 BB 改成当场 `:free()`（旧写法只丢引用等 LuaJIT 终值器），真机连续翻页 510 页 RSS 从「一路涨到 2.13GB」变成 157MB 平台。**崩溃核实**：A/B 对照实验（A=零本项目代码的上游解码/ImageViewer 压测，B=真实阅读器自动翻页 600 页）**全部零崩溃、tombstone 恒 10 条**，那批 libluajit `mfree` unlink SIGSEGV 与阅读时长/翻页无因果，属稀有事件。**r10 非阻塞网络栈**（asyncnet + 桥 promise + await 跨拍）代码全部落地并由 457 单测钉住，但 `async_http` **默认关**：真机证伪了 M1 前提——本机 luasocket 的 `http.request` 是 C 闭包，可暂停 conn 的四个钩子全在 C 帧之内，`attempt to yield across C-call boundary` 无法绕过；用户已拍板停在这里，不再自写 HTTP/1.1 客户端。闸门：**457 单测 / 语法 17 / no-hold 17 文件 / vendored `f0b2c8413d438bd2…` 全绿**。
+**功能面**：安卓平板 13 源装机全链路可用（源列表/主页/分类/详情/章节/阅读/前后章/下载/缓存/离线/收藏/历史/搜索/引擎状态），搜索与分类的「不可用」真因是 `htmlparse.lua` 的 CSS 属性选择子只实现 `[a=v]` 一种形状（恒 0 命中且不报错），已补齐运算符全集并真机端到端取证；**阅读器降采样解码（R4.2 / T26）已于 2026-09-28 以方案 A+B 落地并真机点验，不加设置项**（数字见下方「待办」段与 `changes/ezvenera-koreader-port/tasks.md` 的「T26 落地（A+B）与真机点验」节）。**离线下载**已改成取消/失败保留字节 + 断点续传（manifest 加 `complete` 位），未完成章由 `listPartials()` 在缓存界面单独列出。**内存**：阅读器逐出解码 BB 改成当场 `:free()`（旧写法只丢引用等 LuaJIT 终值器），真机连续翻页 510 页 RSS 从「一路涨到 2.13GB」变成 157MB 平台。**崩溃核实**：A/B 对照实验（A=零本项目代码的上游解码/ImageViewer 压测，B=真实阅读器自动翻页 600 页）**全部零崩溃、tombstone 恒 10 条**，那批 libluajit `mfree` unlink SIGSEGV 与阅读时长/翻页无因果，属稀有事件。**r10 非阻塞网络栈**（asyncnet + 桥 promise + await 跨拍）代码全部落地并由 457 单测钉住，但 `async_http` **默认关**：真机证伪了 M1 前提——本机 luasocket 的 `http.request` 是 C 闭包，可暂停 conn 的四个钩子全在 C 帧之内，`attempt to yield across C-call boundary` 无法绕过；用户已拍板停在这里，不再自写 HTTP/1.1 客户端。闸门：**457 单测 / 语法 17 / no-hold 17 文件 / vendored `f0b2c8413d438bd2…` 全绿**。
 
 ## 最近提交（本轮及上一轮，HEAD 起）
 
@@ -46,7 +47,7 @@
 ## 验证与真机状态
 
 - **闸门命令**：
-  `export PYTHONIOENCODING=utf-8; tools/.venv/Scripts/python.exe scripts/run_tests.py`（457 例，基线恒含 1 条 `libcrypto` SKIP）
+  `export PYTHONIOENCODING=utf-8; tools/.venv/Scripts/python.exe scripts/run_tests.py`（**461 例**，2026-09-28 #72 落地后；基线恒含 1 条 `libcrypto` SKIP）
   `… scripts/check_syntax.py`（17/17）· `… scripts/check_no_hold.py`（17 文件干净）· `… scripts/verify_vendored.py`（`f0b2c8413d438bd2…`）
   按文件过滤：`run_tests.py reader_cache`
 - **平板（`<设备序列号>`，`adb devices` 只有一台 / Android 6 / KOReader v2026.07.1）**：`plugins/ezvenera.koplugin` 下 **17 个 .lua 与源仓逐文件 md5 一致**（含本轮 `browser.lua` = `20b009da…`）。`async_http` 默认关 ⇒ 设备行为与 M3 之前逐字节一致。
@@ -61,11 +62,16 @@
 3. 大图首拍偶发 `wantread` / `sink timeout`（~7s），第二拍重试即 200——r9 的两次尝试链兜住，属已知形状。
 4. `tests/tlsfake.lua` 的假栈每次事务结束就 `close` ⇒ 本地测不到隧道复用，那条由 `test_netclient` 的「异步建隧同步复用」钉住。
 5. Kindle 4 冻结（恢复时按零 patchelf 配方重编引擎）。
+6. #72 A 在这台平板（面板宽 1200）上对**所有实测真页是空操作**（页宽 800~1115 < 1200，三章实测 `clamp生效= 0`）：它只在页宽 > 面板宽的宽图上接管，收益 56% 驻留、代价单页 +160ms。**别把它读成"内存问题已解决"**——真页内存由上一条的当场 `:free()` 与字节软上限管着。
+7. #72 B 的「至少常驻 2 页」硬下限在 ≤6MB/页 的形状上 **binding 不到**（同章 `page_bb_min_pages` 设 1/2/4，解码次数全为 8/10 访问页）：真机的免费回翻实际由既有的 `bbStillReferenced()` 提供。它是显式不变量，只在 >6MB 的 RGB32 大页（1115×1600 webp = 7.14MB ⇒ 12MB 预算只留 1 页）时才起作用。
 
 ## 待办（接手后的优先级）
 
-- **#65 发布 r9/r10**：走仓库外脱敏暂存树（`ezv_scratch/make_pub_stage.py`，**跑前先清空暂存树**）→ 逐 blob 对拍（差异只允许落在被脱敏改写的 `*.md`）→ `commit-tree` 快进挂远端 HEAD（**不强推**）→ CI `test` + `engine-build-dryrun` 双绿。公开仓当前 `main = 2e6d67c`（r8）。
-- **#64 同步构建机母本 `doubaomanhua.js`** 的双重主机修复（平板已改，母本未改 ⇒ 下次整包推送会把缺陷带回）。
-- **#28 jshost 容忍 ESM 包装**（`export default` / `import`）；**#29 explore 成员**（移植源只有发现、无分类）；**#30 移植包 21 个语法错误源**。
-- 用户侧三件（不是我们的活，但要在状态汇报里挂着）：吊销已用过的 PAT；开 GitHub Support 工单对 `EZVenera4KO` 做对象 GC 并确认 fork；轮换签名 keystore 与构建机口令（换签名 ⇒ 平板须 `adb uninstall` 重装，`/sdcard/koreader` 数据保留）。
-- 已明确**不做**：T20 `modifyImage`（零消费者）、图片首拍超时形状改动、r10 M1'/M4、`categoryComics.optionLoader` 动态筛选、扫码远程输入（红线，不得恢复）。
+- **#65 发布 r9/r10 —— 已完成（2026-09-27）**：公开仓 `main` 从 `2e6d67c`（r8）**快进**到 `2ec26cc`（r9，源仓 `75ce1af`+`78838c7`+`0d11a59` 的合集，27 文件）；CI `test` + `engine-build-dryrun` 在新 tip 上均 `completed success`；`init.js`/`.sha256` blob 与源仓逐字节相同。发布脚本换成 `ezv_scratch/pub_snapshot2.sh`（在公开仓本地 clone 里造提交：源仓对象库没有远端 parent；导出 `GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE` **之前**先取源仓侧的值，否则路径对拍会被导出的 `GIT_DIR` 拐走；`--push` 才动远端）。本轮发布树的 `AGENTS.md` 落后一次（不含"已发布 r9"这句），以源仓为准。
+- **#72 / T26 阅读器降采样解码 —— 已完成（2026-09-28，源仓 `de437a7` + 文档 `ff88f05`/`0ab4212`）**：方案 A（新增 `Browser:imageDims()` 只读容器头取宽高，`servePage` 仅当页宽 > 面板宽才成对传 `(req_w, req_h)`）+ 方案 B（BB 逐出保留字节软上限 12MB + 「至少常驻 2 页」硬下限，两把构造参数把手 `page_bb_bytes` / `page_bb_min_pages`）；**按用户要求不加设置项**，C（钉 800）判定不做。真机（面板 1200×1920）：dims 13 样本 mismatch=0、宽图 clamp 后驻留比值 56%、三章真实阅读器 `clamp生效= 0`（对实测真页是空操作）、RSS 138~147MB 全程平、`Fatal signal`/`ANR in` 0 条、tombstone 恒 10；B 的硬下限在 ≤6MB/页 形状上 binding 不到（同章 min 设 1/2/4 解码次数全为 8/10 访问页），作为显式不变量保留。闸门：**461 单测 / 语法 17 / no-hold 17 / vendored `f0b2c8413d438bd2…`**。完整表格在 `changes/ezvenera-koreader-port/tasks.md` 的「T26 落地（A+B）与真机点验」节。
+- **公开快照 r10 待推**（上述 #72 这轮只落在源仓，公开 `main` 仍是 `2ec26cc` = r9）：要发就走 `ezv_scratch/pub_snapshot2.sh`，口径同上条 #65。
+- **#64 构建机母本 `doubaomanhua.js` 的双重主机修复 / #30 移植包语法错误源 —— 已移交漫画源团队（用户决策 2026-09-27），本项目不排期**。宿主侧等价防御已在位（#66 URL 双主机先于网络判掉、R3.1 解析失败静默跳过）。2026-09-28 只读复核：平板 `<dataDir>/ezvenera/sources/doubaomanhua.js`（15783 B）的 `loadEp` **守卫在位**，缺的只是母本那份。
+- **#28 jshost 容忍 ESM 包装 / #29 explore 成员 —— 已关单（2026-09-27 核账）**：代码与回归早就在仓（`jshost.lua` 的 `stripModuleSyntax`/`normalizeSourceJs` + `tests/test_jshost_esm.lua`；`browser.lua` 的带下标成员路径 + `exploreItems` 四形状 + `tests/test_browser_explore.lua`，r10 M3 已转 CPS），只是任务清单没跟进。
+- **#71 WebP/GIF 真机解码 —— 已关闭（2026-09-27）**：全部解得开，宿主零改动。
+- 用户侧三件（不是我们的活，但要在状态汇报里挂着）：吊销已用过的 PAT；开 GitHub Support 工单对 `EZVenera4KO` 做对象 GC 并确认 fork；轮换签名 keystore 与构建机口令（换签名 ⇒ 平板须 `adb uninstall` 重装，`/sdcard/koreader` 数据保留）。另：**构建云实例 2026-09-30 到期**，续不续归用户。
+- 已明确**不做**：T20 `modifyImage`（零消费者）、图片首拍超时形状改动、r10 M1'/M4、`categoryComics.optionLoader` 动态筛选、C 方案钉 800、扫码远程输入（红线，不得恢复）。

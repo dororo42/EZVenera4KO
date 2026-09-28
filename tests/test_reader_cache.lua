@@ -58,6 +58,9 @@ stub("ui/widget/imageviewer", {
 })
 local decoded = 0
 local freed_bbs = 0
+-- 夹具页的 BB 形状由用例设定（webp 解成 RGB32 一页 7.14MB，jpeg 5.35MB，
+-- 真机实测；预算用例要能造出这两种尺寸）。
+local bb_stride, bb_h = 600, 800
 -- 真机 BB 是 FFI cdata，带 stride/h（browser.lua 按 stride*h 记解码内存预算）。
 -- 二次 free 在 LuaJIT 里只是 no-op（blitbuffer.lua:1472 先清 ALLOCATED 再
 -- ffi.gc(self,nil)），所以这里不设断言，只数「逐出时到底回收了几次」。
@@ -67,11 +70,21 @@ local function bbFree(self)
         freed_bbs = freed_bbs + 1
     end
 end
+-- decode_calls 记录每次解码收到的请求宽高：降采样（#72 A）只能从这里验，
+-- 判据是「页比面板宽才传宽高」，而上游 scaleBlitBuffer 缺一半入参就不缩放。
+local decode_calls = {}
 stub("ui/renderimage", {
-    renderImageData = function(_, data)
+    renderImageData = function(_, data, size, want_frames, req_w, req_h)
         decoded = decoded + 1
-        return { __bb = true, data = data, free = bbFree, stride = 600, h = 800 }
+        table.insert(decode_calls, { req_w = req_w, req_h = req_h })
+        return { __bb = true, data = data, free = bbFree,
+                 stride = bb_stride, h = bb_h }
     end,
+})
+-- 面板 1200x1920（真机平板）：placeholderPage 与降采样判据都读它。
+stub("device", {
+    screen = { getWidth = function() return 1200 end,
+               getHeight = function() return 1920 end },
 })
 stub("ffi/blitbuffer", {
     TYPE_BB8 = 1, COLOR_GRAY_E = 233, COLOR_WHITE = 255,
@@ -98,6 +111,10 @@ local function makeReader(images, opts)
         if opts.fail_urls and opts.fail_urls[o.url] then
             return { status = 500, headers = {}, body = nil }
         end
+        -- 降采样用例要按容器喂真形状的头（opts.bodies），其余用例保持占位字节。
+        if opts.bodies and opts.bodies[o.url] then
+            return { status = 200, headers = {}, body = opts.bodies[o.url] }
+        end
         return { status = 200,
                  headers = { ["content-length"] = "12" },
                  body = "IMG:" .. o.url }
@@ -107,9 +124,13 @@ local function makeReader(images, opts)
     fake.viewer = nil
     decoded = 0
     freed_bbs = 0
+    decode_calls = {}
+    bb_stride = opts.bb_stride or 600
+    bb_h = opts.bb_h or 800
     local b = Browser.new{ infoMessage = noop, netclient = net,
                            page_cache_bytes = opts.cache_budget,
-                           page_bb_bytes = opts.bb_budget }
+                           page_bb_bytes = opts.bb_budget,
+                           page_bb_min_pages = opts.bb_min_pages }
     b._hasMember = function() return false end
     b._awaitSource = function(_, _k, path)
         if path == "comic.loadEp" then return images end
@@ -517,6 +538,159 @@ function tests.scheme_in_query_is_a_value_not_a_second_host()
     assert(txt:find("/1.webp", 1, true), "query-stripped path logged: " .. txt)
     assert(not txt:find("deadbeef", 1, true), "no token in logcat")
     assert(not txt:find("next=http", 1, true), "no query in logcat")
+    return true
+end
+
+-- ---------- #72 降采样解码：头尺寸 + clamp 判据 + BB 驻留下限 ----------
+
+local function be16(v)
+    return string.char(math.floor(v / 256) % 256, v % 256)
+end
+local function be32(v)
+    return string.char(math.floor(v / 16777216) % 256, math.floor(v / 65536) % 256,
+        math.floor(v / 256) % 256, v % 256)
+end
+local function le16(v)
+    return string.char(v % 256, math.floor(v / 256) % 256)
+end
+local function le24(v)
+    return string.char(v % 256, math.floor(v / 256) % 256,
+        math.floor(v / 65536) % 256)
+end
+local function le32(v)
+    return le24(v) .. string.char(math.floor(v / 16777216) % 256)
+end
+
+-- 形状逐字节照抄真机夹具（夹具尺寸由探针实测：page.webp 800x1137、
+-- anim.webp 1115x1600、wide.jpg 1600x2300）。字节一律用 string.char 拼：
+-- 源文件里放 \x 转义会被编辑器/换行策略二次加工，桩形状必须先自己站得住。
+local function jpgBytes(w, h)
+    return string.char(0xFF, 0xD8, 0xFF, 0xE0) .. be16(16) .. string.rep("a", 14)
+        .. string.char(0xFF, 0xC0) .. be16(17) .. string.char(0x08)
+        .. be16(h) .. be16(w) .. string.rep("b", 40)
+end
+local function webpBytes(w, h)
+    return "RIFF" .. le32(0) .. "WEBP" .. "VP8 " .. le32(20)
+        .. string.rep("c", 3) .. string.char(0x9D, 0x01, 0x2A)
+        .. string.char(w % 256, math.floor(w / 256) % 64)
+        .. string.char(h % 256, math.floor(h / 256) % 64)
+        .. string.rep("d", 20)
+end
+local function webpXBytes(w, h)
+    return "RIFF" .. le32(0) .. "WEBP" .. "VP8X" .. le32(10)
+        .. string.char(0x12) .. string.char(0, 0, 0) .. le24(w - 1) .. le24(h - 1)
+        .. "ANIM" .. le32(6) .. string.char(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+end
+local function gifBytes(w, h)
+    return "GIF89a" .. le16(w) .. le16(h) .. string.rep("e", 20)
+end
+local function pngBytes(w, h)
+    return string.char(0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A)
+        .. be32(13) .. "IHDR" .. be32(w) .. be32(h) .. string.rep("f", 20)
+end
+
+
+-- 【#72 A】尺寸必须只读头拿到（解码前决定），四种真机容器 + 三种「不该猜」的
+-- 形状。判错的代价是「按错尺寸缩放」或「该缩的不缩」。
+function tests.image_dims_reads_container_headers_without_decoding()
+    local b = Browser.new{ infoMessage = noop }
+    assert_eq("jpeg SOF (APP0 必须先按段长跳掉)", "1600x2300",
+        table.concat({ b:imageDims(jpgBytes(1600, 2300)) }, "x"))
+    assert_eq("webp 简单格式", "800x1137",
+        table.concat({ b:imageDims(webpBytes(800, 1137)) }, "x"))
+    assert_eq("webp 扩展格式（动图，画布各减一）", "1115x1600",
+        table.concat({ b:imageDims(webpXBytes(1115, 1600)) }, "x"))
+    assert_eq("gif", "1115x1600",
+        table.concat({ b:imageDims(gifBytes(1115, 1600)) }, "x"))
+    assert_eq("png", "1600x2300",
+        table.concat({ b:imageDims(pngBytes(1600, 2300)) }, "x"))
+    -- 判不准返回 nil ⇒ 原样按原生尺寸解码，绝不猜
+    assert_eq("html 不是图", nil,
+        b:imageDims("<html><body>x</body></html>" .. string.rep("g", 40)))
+    assert_eq("截断的 jpeg 头", nil, b:imageDims(jpgBytes(1600, 2300):sub(1, 12)))
+    assert_eq("太短", nil, b:imageDims("GIF8"))
+    assert_eq("nil 入参", nil, b:imageDims(nil))
+    return true
+end
+
+-- 【#72 A】只有「页宽 > 面板宽」才传请求宽高（桩面板 1200）。真实页宽
+-- 800~1115 时 clamp 是空操作（真机三档实测：耗时与字节全同）；而一旦要缩，
+-- 宽高必须都传 —— 上游 scaleBlitBuffer 缺任一入参就直接不缩放
+-- （renderimage.lua 的 `if not width or not height then return bb end`，
+-- 也正是 r10 M1 那个丢 prefix 的同类坑）。
+function tests.only_overwide_pages_are_clamped_to_the_panel()
+    local imgs = urls(3)
+    local b = makeReader(imgs, { bodies = {
+        [imgs[1]] = jpgBytes(1600, 2300),
+        [imgs[2]] = jpgBytes(1200, 1725),
+        [imgs[3]] = webpBytes(800, 1137),
+    } })
+    b:showReader("baozi", "c1", "7", "t", "第7话")
+    local pt = fake.viewer_args.image
+    touch(pt, 1)
+    runScheduled(1)                      -- 首屏走延迟一拍
+    assert_eq("宽于面板的页 clamp 到面板宽", 1200, decode_calls[1].req_w)
+    assert_eq("高按比例且四舍五入", 1725, decode_calls[1].req_h)
+    touch(pt, 2)
+    assert_eq("恰好等宽的页不缩", nil, decode_calls[2].req_w)
+    touch(pt, 3)
+    assert_eq("窄页（真机主流形状）不缩", nil, decode_calls[3].req_w)
+    return true
+end
+
+-- 【#72 B】webp/GIF 页解成 RGB32：1115x1600 一页 7.14MB，12MB 固定预算只装得下
+-- 一页 ⇒ 逐出会把刚用过的页吐掉，回翻必重解。逐出因此保留两条线：字节上限（软）
+-- + 最少常驻 2 页（硬）。判据用「回翻到底重解了几次」，那才是用户能感知的差别。
+-- 真机口径（2026-09-28 三章实测）：单页 ≤6MB 时字节线先 binding，这条硬下限不
+-- 改变行为；页字节 3.64MB(webp 800x1137) 与 5.10MB(jpeg 1115x1600) 两档实测
+-- clamp=0、每访问页 0.8~1.0 次解码、RSS 平在 138~147MB、零 tombstone 零 ANR。
+-- 用例把 fake.viewer.image 清掉，是为了绕开「屏幕上那页有引用保护」这一层，
+-- 让逐出只由预算与页数下限支配——真机正向翻页时那层保护也在，所以下限只在
+-- 大页（>6MB）形状上才显出差别。
+function tests.bb_budget_keeps_two_webp_sized_pages_resident()
+    local imgs = urls(4)
+    -- 真机 webp 页形状：stride 4460（RGB32）x 1600 = 7136000 B/页
+    local b = makeReader(imgs, { bb_stride = 4460, bb_h = 1600 })
+    b:showReader("baozi", "c1", "7", "t", "第7话")
+    local pt = fake.viewer_args.image
+    touch(pt, 1)
+    runScheduled(1)
+    -- 这一轮不保护屏幕上那页（桩里 viewer.image 由 repaint 置过，清掉它），
+    -- 让逐出只受预算与页数下限支配，判据才干净。
+    fake.viewer.image = nil
+    local bb1 = pt[1]
+    local bb2 = pt[2]
+    assert_eq("两页 14.3MB 已超 12MB 预算但不逐", 0, freed_bbs)
+    local bb3 = pt[3]
+    assert_eq("第三页才逐出最旧的一页", 1, freed_bbs)
+    assert_eq("逐出的正是页 1", true, bb1.__freed)
+    assert_eq("页 2 留着", nil, bb2.__freed)
+    assert_eq("页 3 留着", nil, bb3.__freed)
+    assert_eq("总解码次数", 3, decoded)
+    -- 这就是 B 的用户可见差别：驻留的 2、3 页回翻一次都不重解。旧的「逐到
+    -- 只剩 1 页」写法下，页 2 早在页 3 进来时就被回收，这里要多解 1 次。
+    touch(pt, 2)
+    touch(pt, 3)
+    assert_eq("驻留页回翻不重解", 3, decoded)
+    return true
+end
+
+-- 上一条的对照：把硬下限调回旧语义（1 页）就必然吐回 thrash。这条同时钉住
+-- 「page_bb_min_pages 能从构造参数注入」——真机探针要用同一个把手做 A/B。
+function tests.bb_floor_at_one_page_makes_flip_back_re_decode()
+    local imgs = urls(3)
+    local b = makeReader(imgs, { bb_stride = 4460, bb_h = 1600, bb_min_pages = 1 })
+    b:showReader("baozi", "c1", "7", "t", "第7话")
+    local pt = fake.viewer_args.image
+    touch(pt, 1)                       -- 首屏那一拍只给占位页（ANR 规避）
+    runScheduled(1)                    -- 节拍里才真下载 + 解码页 1
+    local bb1 = pt[1]                  -- 这一次命中缓存，拿到的就是页 1 的 BB
+    fake.viewer.image = nil            -- 同上一条用例：逐出只受预算与页数下限支配
+    touch(pt, 2)                       -- 页 2：14.3MB 超 12MB 预算，下限=1 ⇒ 逐到只剩 1 页
+    assert_eq("下限=1 时页 2 一进来就把页 1 挤掉", 1, freed_bbs)
+    assert_eq("页 1 的 BB 已回收", true, bb1.__freed)
+    touch(pt, 1)                       -- 回翻
+    assert_eq("回翻页 1 必然重解", 3, decoded)
     return true
 end
 

@@ -58,7 +58,7 @@
 | R3.3 | `convert` 必须与 pointycastle 行为一致：AES-ECB/CBC/CFB8/OFB **无填充**、raw 摘要（md5/sha1/sha256/sha512）、HMAC（含 hexString 变体）、base64、UTF-8；GBK 解码为 P2 | P0 |
 | R3.4 | 漫画源管理：从索引浏览/安装/更新/删除源文件。**默认索引** = `https://raw.githubusercontent.com/WEP-56/EZvenera-config/main/index.json`（WEP-56/EZvenera-config 仓库，可配置 URL；索引条目 schema = `[{name, fileName, key, version, description?}]`，下载地址 = 索引基址 + `fileName`，提供 jsdelivr CDN 备选以改善直连可达性）。**本地源**：用户在指定目录（`<data>/ezvenera/index/`）放置的 `*.json` 索引文件参与合并（同 `key` 时本地条目优先），支持本地 `.js` 直接安装 | P1 |
 | R3.5 | 浏览流程：源列表→搜索/分类→结果列表→详情→章节→图片页序列 | P1 |
-| R3.6 | 图片管线：onImageLoad→headers/method 处理→onResponse→modifyImage（P2）→下载缓存→显示 | P1（modifyImage P2） |
+| R3.6 | 图片管线：onImageLoad→headers/method 处理→onResponse→modifyImage（P2）→下载缓存→显示 | P1（modifyImage P2）**【2026-09-27：modifyImage 判定不做 = tasks.md T20；装机 15 源真消费者 0，`handlers["image"]` 维持返回明确错误。WebP/GIF 解码真机已验 = T27 / 任务 #71 关闭：copy_manga 画质档改写的真 `.webp` 页与动图 GIF/WebP 全部解得开（libwebp/giflib/MuPDF 三后端逐一点名实测），宿主无需改动；副产品是查出「webp/gif 回 RGB32、jpeg 回 RGB24 ⇒ 同尺寸多 1/3 驻留」，见 T26】** |
 
 **AC**
 - AC3.1 单测：用固定样例 JS（模板级最小 ComicSource）经 quickjs 引擎解析出 name/key/version（需引擎，S2 后）。
@@ -71,12 +71,12 @@
 | REQ | 内容 | 优先级 |
 |---|---|---|
 | R4.1 | 页图用 ImageViewer 图像列表模式 + 惰性下载（opdspse 蓝图）；翻页：触屏滑动（安卓）+ D-pad/PgFwd/PgBack（Kindle 4 冻结路径） | P1 |
-| R4.2 | 显示前降采样/裁剪到面板宽（≤800px 宽），解码内存上限保护（256MB 设备） | P0（阅读路径一启用即生效） |
+| R4.2 | 显示前降采样/裁剪到面板宽（≤800px 宽），解码内存上限保护（256MB 设备） | P0（阅读路径一启用即生效）**【2026-09-28 已实施（tasks.md T26，方案 A + B，无新增设置项）：① 只读容器头部拿宽高（`Browser:imageDims`，不解码不联网），**仅当页宽 > 面板宽** 才把宽高成对传给 `renderImageData` ⇒ 真实页图（800~1200 宽）一次都不 clamp、零质量损失，宽图驻留 11.04MB→6.21MB（jpg）/ 14.72MB→8.28MB（webp）；② BB 逐出保留「字节上限 12MB（软）+ 最少常驻 2 页（硬）」两条线。**原文的「≤800px」按 C 方案判定不做**：×2~4 解码 + 放大永久糊（我们交 `image = page_table` 表，上游 `_scaled_image_func` 只在 `image` 是函数时启用）。真机点验：dims 13/13 逐张与解码宽高一致、三个真实章节 `clamp生效= 0`、硬下限在 ≤6MB/页的形状上 binding 不到（真机免费回翻由既有的 `bbStillReferenced` 保护提供），保留为显式不变量覆盖 #71 那类 >6MB 的 RGB32 大页】** |
 | R4.3 | 翻页后全刷（full, dithered）清残影；菜单内不使用动画 | P1 |
 | R4.4 | 下载超时与失败提示（socketutil 超时框架），失败页可重试 | P1 |
 
 **AC**
-- AC4.1 打开一章：内存峰值 < 60MB（真机 `cat /proc/meminfo` 或 KOReader RAM 指示器观测）。
+- AC4.1 【口径修订 2026-09-27】原文「打开一章：内存峰值 < 60MB」是 **256MB Kindle 4 时代**的数字，随设备冻结不再作为验收线。**当前安卓平板验收线**：阅读器 RSS 在长时间翻页下必须是**平台型**而非单调上涨 —— 实测 139992 → 157020 KB 平台（±5MB 抖动，510 页长跑，AGENTS「阅读器逐出解码 BB 必须当场 `:free()`」条）。**驻留基线（真机实测，tasks.md T26）**：一页 BB 的字节 = stride×高，jpeg 走 RGB24（3B/px）、webp/GIF 走 RGB32（4B/px）——真机同章两种画质档实测 **800×1137 webp = 3.64MB**、**1115×1600 jpeg = 5.10MB**，夹具尺寸 1115×1600 的 webp 则是 7.14MB ⇒ 12MB 预算下留 2~3 页（大页只留 1 页，由「最少常驻 2 页」硬下限兜）。**2026-09-28 降采样（只 clamp 宽图）+ 预算双线上地后的新基线**：三个真实章节 10 访问页长跑 RSS 117136 → 146804 KB 全程平台、`Fatal signal` 0 / `ANR in` 0、`clamp生效= 0`（真页宽 ≤ 面板宽，符合预期）。
 - AC4.2 翻页后屏幕无可见残影（真机人工）；翻页动作本身无动画残留。
 - AC4.3 断网时打开页面：显示失败提示而非卡死（可本地模拟超时单测 netclient 超时分支）。
 
