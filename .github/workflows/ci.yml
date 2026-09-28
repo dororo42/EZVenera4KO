@@ -46,8 +46,12 @@ jobs:
           if ! command -v cmake >/dev/null 2>&1; then
             sudo apt-get install -y cmake
           fi
-          ./scripts/fetch-quickjs.sh
-          ./scripts/build-quickjs.sh --target x86_64
+          # 走 `bash <script>` 而不是 `./<script>`：仓库里 .sh 的 git mode 是
+          # 100644（开发机 Windows `core.filemode=false`，发布走暂存树 `git add -A`
+          # 也按文件系统取模式），干净检出里没有可执行位 ⇒ `./script` 直接
+          # exit 126 Permission denied（2026-09-28 r11 首次上 CI 就是红在这一步）。
+          bash ./scripts/fetch-quickjs.sh
+          bash ./scripts/build-quickjs.sh --target x86_64
           LIB=""
           for f in "$GITHUB_WORKSPACE"/build/quickjs-host/libquickjs.so \
                    "$GITHUB_WORKSPACE"/build/quickjs-host/libquickjs.so.* \
