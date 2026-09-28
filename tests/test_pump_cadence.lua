@@ -75,11 +75,13 @@ end
 local function makeEngine(opts)
     opts = opts or {}
     local eng = { initialized = true, pumps = 0, busy_flag = opts.busy,
-                  aborted = 0 }
+                  aborted = 0, capped = opts.capped }
     function eng:pump()
         self.pumps = self.pumps + 1
         if opts.throws then error("js host died") end
-        return 0, true
+        -- 注意 or 陷阱：capped 时必须显式 false（and-or 链会恒 true）
+        -- 读 self.capped：测试中改 eng.capped 才能生效（opts 是另一张表）
+        return 0, not self.capped
     end
     function eng:busy() return self.busy_flag == true end
     -- 注意是闭包捕获 eng，不是 self：abortHttp 被 : 调用时多带一个自变量
@@ -160,6 +162,52 @@ function tests.pump_stops_when_engine_is_gone()
         inst._engine = nil              -- 引擎被释放/换掉
         s[1].cb()
         assert_eq("自然停摆，不续拍", 1, #s)
+        assert_eq("运行标记关掉", false, inst._pump_running)
+    end)
+    return true
+end
+
+--- Y1（核实报告 §2）：job/timer 触顶（drained=false）加速节拍
+function tests.pump_backpressure_speeds_the_pump_up()
+    local eng = makeEngine{ capped = true }   -- pump 返回 (0, false)
+    local sched, warns = withPump(eng, function(inst, s)
+        inst:_startEnginePump(eng)
+        s[1].cb()
+        assert_eq("触顶时收到 0.05s", 0.05, s[2].delay)
+        eng.capped = false                   -- 积压排完，回慢周期
+        s[2].cb()
+        assert_eq("排空后回到 0.5s", 0.5, s[3].delay)
+    end)
+    return true
+end
+
+--- Y4（核实报告 §2）：换引擎世代守卫——旧链静默消亡，新链接管
+function tests.pump_restarts_with_new_engine_generation()
+    local eng1 = makeEngine{ busy = false }
+    local eng2 = makeEngine{ busy = false }
+    local sched = withPump(eng1, function(inst, s)
+        inst:_startEnginePump(eng1)
+        s[1].cb()                            -- eng1 第一拍（已排 s[2]）
+        inst._engine = eng2
+        inst:_startEnginePump(eng2)          -- 世代 +1，新链 s[2]→s[3]
+        local before = #s
+        s[2].cb()                            -- 旧链已排队 tick：静默消亡
+        assert_eq("旧链世代过期不续拍", before, #s)
+        assert_eq("旧引擎没被再泵", 1, eng1.pumps)
+        s[3].cb()                            -- 新链 tick：正常续拍
+        assert_eq("新链接管续拍", before + 1, #s)
+        assert_eq("新引擎被泵", 1, eng2.pumps)
+    end)
+    return true
+end
+
+function tests.stop_plugin_stops_the_pump()
+    local eng = makeEngine()
+    local sched = withPump(eng, function(inst, s)
+        inst:_startEnginePump(eng)
+        inst:stopPlugin()
+        s[1].cb()
+        assert_eq("停用后不续拍", 1, #s)
         assert_eq("运行标记关掉", false, inst._pump_running)
     end)
     return true

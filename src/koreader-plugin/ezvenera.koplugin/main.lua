@@ -214,21 +214,32 @@ end
 --- UIManager 单线程 + 轻量拍（空队列时两个探测调用而已）；
 --- pcall 全包 + 失败自动停摆（泵坏了不能拖垮 UI 循环）。
 function EzVenera:_startEnginePump(engine, interval)
-    if self._pump_running then return end
     local UIManager = require("ui/uimanager")
     if not (UIManager and type(UIManager.scheduleIn) == "function") then
         return
     end
+    -- Y4（核实报告 §2）：同引擎不重复起链；换引擎（插件重载/重初始化）
+    -- 时以世代号废弃旧链——旧 tick 下拍自然退出，不会双泵并行
+    if self._pump_running and self._pump_engine == engine then
+        return
+    end
+    self._pump_engine = engine
+    self._pump_gen = (self._pump_gen or 0) + 1
+    local gen = self._pump_gen
     self._pump_running = true
     local period = interval or 0.5
     local function tick()
-        -- 引擎被换/释放后自然停摆
+        if not (self._pump_running and gen == self._pump_gen) then
+            return  -- 世代过期（换引擎/停用）：旧链静默消亡
+        end
         local eng = self._engine
-        if not (self._pump_running and eng and eng.initialized) then
+        if not (eng and eng.initialized) then
             self._pump_running = false
             return
         end
-        local ok, err = pcall(function() eng:pump() end)
+        local ok, executed, drained = pcall(function()
+            return eng:pump()
+        end)
         if not ok then
             self._pump_running = false
             -- 泵死了，在飞请求的 Promise 再也不会有人兑现：直接取消，
@@ -240,20 +251,34 @@ function EzVenera:_startEnginePump(engine, interval)
             end)
             local logger = require("logger")
             if logger and logger.warn then
+                -- pcall 失败时第二个返回值是错误消息（不是 executed）——
+                -- 名字照抄成功分支会让人下次改动读错，这里显式取别名
+                local err = executed
                 logger.warn("[ezvenera] engine pump stopped:", tostring(err))
             end
             return
         end
         -- 网络在飞时把周期收到 0.05s：一次「等数据」= 一个泵周期，
         -- 0.5s 的步进会把一次握手拖成好几拍。空闲时回到 0.5s不吃 CPU。
+        -- Y1（核实报告 §2）：job/timer 触顶（drained=false）同样加速——
+        -- 自续 setTimeout 型源的积压要连拍排掉，而不是每 0.5s 磨一层。
         -- 调用方显式指定 interval 时保持定值（单测要可预期）。
         local next_period = period
-        if not interval and eng.busy and eng:busy() then
+        if not interval and (drained == false
+                or (eng.busy and eng:busy())) then
             next_period = 0.05
         end
         UIManager:scheduleIn(next_period, tick)
     end
     UIManager:scheduleIn(period, tick)
+end
+
+--- 插件停用钩子（pluginloader honors stopPlugin）：Y4——
+--- 关掉泵与自动落盘的续拍；引擎随 _engine 释放时 tick 亦自然停。
+function EzVenera:stopPlugin()
+    self._pump_running = false
+    self._pump_gen = (self._pump_gen or 0) + 1
+    self._settings_autoflush = false
 end
 
 --- 惰性 browser 访问（2026-09-22 双崩溃修复：此前 _browser 仅在引擎

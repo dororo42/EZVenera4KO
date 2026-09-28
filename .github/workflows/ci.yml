@@ -24,18 +24,61 @@ jobs:
       - name: Lua syntax check (all plugin modules)
         run: python scripts/check_syntax.py
 
-      - name: Unit tests
-        run: python scripts/run_tests.py
-
       - name: No hold-dependency check (ADR-005, Kindle 4 red line)
         run: python scripts/check_no_hold.py
 
       - name: Vendored init.js integrity (ADR-002)
         run: python scripts/verify_vendored.py
 
+      # 必须在 fetch-quickjs.sh **之前**跑：vendor/quickjs 一旦存在，build.rs
+      # 就会真的 cc 编译 quickjs.c/libbf.c（几分钟，且不在此前绿基线覆盖内）。
       - name: Rust bridge skeleton compiles (no vendored quickjs yet — check only)
         run: |
           cd rust/ezvjs-bridge && cargo check   # L14：用 runner 自带 stable，不主动 update
+
+      # tests/test_glue_real.lua 只有装上宿主 libquickjs 才跑得起来；没有库时它
+      # 按 run_tests.py 约定整文件 SKIP ⇒ 此前「glue 已被 CI 覆盖」是假的。
+      # 这一步把 scripts/fetch-quickjs.sh 钉住的 quickjs-ng v0.17.0 真编出来，
+      # 并把 QUICKJS_LIB_PATH 指向**构建目录**产物，不指向插件目录 lib/*.so
+      # （那是 2026-09-25 真机 SIGSEGV 的同名遮蔽向量）。
+      - name: Build host libquickjs (so the glue test executes)
+        run: |
+          if ! command -v cmake >/dev/null 2>&1; then
+            sudo apt-get install -y cmake
+          fi
+          ./scripts/fetch-quickjs.sh
+          ./scripts/build-quickjs.sh --target x86_64
+          LIB=""
+          for f in "$GITHUB_WORKSPACE"/build/quickjs-host/libquickjs.so \
+                   "$GITHUB_WORKSPACE"/build/quickjs-host/libquickjs.so.* \
+                   "$GITHUB_WORKSPACE"/build/quickjs-host/libqjs.so.*.*; do
+            if [ -e "$f" ] || [ -L "$f" ]; then LIB="$f"; break; fi
+          done
+          if [ -z "$LIB" ]; then
+            echo "[err] no shared libquickjs produced" >&2
+            exit 1
+          fi
+          file "$LIB"
+          echo "QUICKJS_LIB_PATH=$LIB" >> "$GITHUB_ENV"
+
+      - name: Unit tests
+        run: python scripts/run_tests.py
+
+      # 反向闸门：glue 一旦重新变成 SKIP，说明上一步的库没被找到，「JS 语义有
+      # 真引擎执行证据」这条就悄悄失效——CI 必须红，而不是绿着一行 SKIP。
+      - name: Glue suite really executed (no silent SKIP)
+        run: |
+          OUT="$(python scripts/run_tests.py glue 2>&1)"
+          echo "$OUT"
+          if printf '%s\n' "$OUT" | grep -q "SKIP test_glue_real.lua"; then
+            echo "[err] test_glue_real.lua SKIPped — QUICKJS_LIB_PATH=$QUICKJS_LIB_PATH" >&2
+            exit 1
+          fi
+          if ! printf '%s\n' "$OUT" | grep -q "^Results: [1-9][0-9]* passed, 0 failed$"; then
+            echo "[err] glue run did not report a passing, non-empty suite" >&2
+            exit 1
+          fi
+          echo "[ok] glue assertions executed under real quickjs-ng"
 
   # 引擎真机构建需要 koxtoolchain（Linux/WSL），CI 中仅验证脚本语法与文档一致性
   engine-build-dryrun:

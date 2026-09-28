@@ -181,8 +181,11 @@ function NetClient:request(opts)
     if type(opts.headers) == "table" then
         for k, v in pairs(opts.headers) do
             -- L5（审查报告 §4）：键值剥离控制字符，堵 CRLF 头注入
-            headers[(tostring(k):gsub("%c", ""))]
-                = (tostring(v):gsub("%c", ""))
+            local key = (tostring(k):gsub("%c", ""))
+            if key ~= "" then
+                -- N5（核实报告 §3）：全控制字符键跳过（空键会碰撞/畸形）
+                headers[key] = (tostring(v):gsub("%c", ""))
+            end
         end
     end
     -- 审查 L7：无 UA 头时注入默认（大小写不敏感探测）

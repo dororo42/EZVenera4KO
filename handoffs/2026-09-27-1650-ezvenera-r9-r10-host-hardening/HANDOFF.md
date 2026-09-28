@@ -3,7 +3,7 @@
 ## 元数据
 
 - Created: 2026-09-27 16:50
-- Updated: 2026-09-28 —— #72/T26 降采样解码落地（方案 A+B）后对齐「待办」段与本条；此刻源仓 HEAD = `0ab4212`（`de437a7` 代码 + `ff88f05`/`0ab4212` 文档），公开 `main` 仍是 `2ec26cc`（r9），闸门基线由 457 → **461**。下面「元数据」里的 Created 行是写作当时的 HEAD，不再等值。
+- Updated: 2026-09-28（第二次对齐）—— #72/T26 降采样解码落地（方案 A+B）后对齐「待办」段与本条；**同日 r10 快照已推送，公开 `main` = `d1c492f`（快进自 `2ec26cc`，CI `test` + `engine-build-dryrun` 双绿）**。此刻源仓 HEAD = 本份文档所属提交（代码 `de437a7` + 文档 `ff88f05`/`0ab4212`/`2e2d781`），闸门基线由 457 → **461**。下面「元数据」里的 Created 行是写作当时的 HEAD，不再等值。
 - Source agent: Qoder 主 agent（本轮 = A/B 对照实验结案 + 阅读器内存修复 + r9/r10 收口会话）
 - Project: <项目根>（本文件按仓库脱敏口径书写，不含本机绝对路径 / 局域网地址 / 凭据）
 - Branch: main，HEAD: 78838c7（工作树干净，无未提交项）
@@ -69,7 +69,7 @@
 
 - **#65 发布 r9/r10 —— 已完成（2026-09-27）**：公开仓 `main` 从 `2e6d67c`（r8）**快进**到 `2ec26cc`（r9，源仓 `75ce1af`+`78838c7`+`0d11a59` 的合集，27 文件）；CI `test` + `engine-build-dryrun` 在新 tip 上均 `completed success`；`init.js`/`.sha256` blob 与源仓逐字节相同。发布脚本换成 `ezv_scratch/pub_snapshot2.sh`（在公开仓本地 clone 里造提交：源仓对象库没有远端 parent；导出 `GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE` **之前**先取源仓侧的值，否则路径对拍会被导出的 `GIT_DIR` 拐走；`--push` 才动远端）。本轮发布树的 `AGENTS.md` 落后一次（不含"已发布 r9"这句），以源仓为准。
 - **#72 / T26 阅读器降采样解码 —— 已完成（2026-09-28，源仓 `de437a7` + 文档 `ff88f05`/`0ab4212`）**：方案 A（新增 `Browser:imageDims()` 只读容器头取宽高，`servePage` 仅当页宽 > 面板宽才成对传 `(req_w, req_h)`）+ 方案 B（BB 逐出保留字节软上限 12MB + 「至少常驻 2 页」硬下限，两把构造参数把手 `page_bb_bytes` / `page_bb_min_pages`）；**按用户要求不加设置项**，C（钉 800）判定不做。真机（面板 1200×1920）：dims 13 样本 mismatch=0、宽图 clamp 后驻留比值 56%、三章真实阅读器 `clamp生效= 0`（对实测真页是空操作）、RSS 138~147MB 全程平、`Fatal signal`/`ANR in` 0 条、tombstone 恒 10；B 的硬下限在 ≤6MB/页 形状上 binding 不到（同章 min 设 1/2/4 解码次数全为 8/10 访问页），作为显式不变量保留。闸门：**461 单测 / 语法 17 / no-hold 17 / vendored `f0b2c8413d438bd2…`**。完整表格在 `changes/ezvenera-koreader-port/tasks.md` 的「T26 落地（A+B）与真机点验」节。
-- **公开快照 r10 待推**（上述 #72 这轮只落在源仓，公开 `main` 仍是 `2ec26cc` = r9）：要发就走 `ezv_scratch/pub_snapshot2.sh`，口径同上条 #65。
+- **#65 公开快照 r10 —— 已完成（2026-09-28）**：公开 `main` 从 `2ec26cc`（r9）**快进**到 `d1c492f`（r10 = 源仓 `de437a7` + `ff88f05` + `0ab4212` + `2e2d781`：阅读器降采样 A + BB 常驻硬下限 B + `imageDims` + R4.2/AC4.1 改账 + #71 的 ADR-006 核销 + 交接件待办归零）。全量树 104 文件、与远端差异只落在 8 个文件（6 个 `*.md` + `browser.lua` + `tests/test_reader_cache.lua`）；`init.js`/`.sha256` blob 与源仓逐字节相同；CI `test` + `engine-build-dryrun` 在 `d1c492f` 上均 `completed success`；未强推。**两条本轮新增的操作事实**：① 本机到 `github.com:443` 直连被 reset/超时（`api.github.com` 仍通），`pub_snapshot2.sh` 的 fetch 与 push 必须先 `export http_proxy/https_proxy=http://<DEV-HOST-LAN-IP>:<PROXY-PORT>`（HTTPS 走 CONNECT 隧道 ⇒ 凭据仍在端到端 TLS 里；命令行不出现 token）；不带代理那次在 `git fetch` 就失败、远端零变化。② 脱敏复核要按**改动文件新旧命中做差集**（`ezv_scratch/scan_changed_files.py`，判据 `added=0`）——整树扫描会把历史里已发布的良性命中（测试桩 `http://<IP>:8080`）一起报出来。发布树的 `AGENTS.md` 落后一次属正常（不含"已发布 r10"这句）。
 - **#64 构建机母本 `doubaomanhua.js` 的双重主机修复 / #30 移植包语法错误源 —— 已移交漫画源团队（用户决策 2026-09-27），本项目不排期**。宿主侧等价防御已在位（#66 URL 双主机先于网络判掉、R3.1 解析失败静默跳过）。2026-09-28 只读复核：平板 `<dataDir>/ezvenera/sources/doubaomanhua.js`（15783 B）的 `loadEp` **守卫在位**，缺的只是母本那份。
 - **#28 jshost 容忍 ESM 包装 / #29 explore 成员 —— 已关单（2026-09-27 核账）**：代码与回归早就在仓（`jshost.lua` 的 `stripModuleSyntax`/`normalizeSourceJs` + `tests/test_jshost_esm.lua`；`browser.lua` 的带下标成员路径 + `exploreItems` 四形状 + `tests/test_browser_explore.lua`，r10 M3 已转 CPS），只是任务清单没跟进。
 - **#71 WebP/GIF 真机解码 —— 已关闭（2026-09-27）**：全部解得开，宿主零改动。

@@ -180,7 +180,7 @@ make check        # = 语法 + 单测 + 无长按红线 + vendored 校验（≈C
 | 脚本 | 作用 |
 |---|---|
 | `check_syntax.py` | 全部 Lua 语法检查 |
-| `run_tests.py` | lupa(LuaJIT) 跑 `tests/*.lua`（当前 267 项） |
+| `run_tests.py` | lupa(LuaJIT) 跑 `tests/*.lua`（数量以 CI 实测为准，持续增长） |
 | `check_no_hold.py` | **红线**：插件目录内不得出现长按（hold）依赖 —— ADR-005 |
 | `verify_vendored.py` | `vendored/init.js` sha256 完整性 —— ADR-002 |
 

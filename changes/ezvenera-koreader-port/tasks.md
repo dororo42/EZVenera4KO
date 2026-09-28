@@ -148,7 +148,7 @@
 - B 的硬下限在实测页形状（≤6MB/页）上 **binding 不到**：真机的免费回翻实际由既有的引用保护提供。它的价值是把「至少常驻 2 页」写成显式不变量，覆盖 #71 里那类 >6MB 的大页（1115×1600 webp = 7.14MB ⇒ 12MB 预算只留 1 页）。**不改默认预算、不加开关**，实测零回归。
 - 闸门：461 单测 / 语法 17 / no-hold 17 文件 / vendored `f0b2c8413d438bd2…`；新增 4 个用例（`image_dims_reads_container_headers_without_decoding`、`only_overwide_pages_are_clamped_to_the_panel`、`bb_budget_keeps_two_webp_sized_pages_resident`、`bb_floor_at_one_page_makes_flip_back_re_decode`），后两条做过变异复验（去掉下限 / 去掉构造参数注入 ⇒ 立刻转红）。
 - **C（钉 800）不做**：×2~4 解码 + 放大永久糊（我们交的是 `page_table` 表，上游 `_scaled_image_func` 不启用）。
-- 对账与收尾：源仓 `de437a7`（代码 + 用例）+ `ff88f05`（文档），公开快照待用户点头。点验之后只补了一处**等价收紧**——GIF 魔数从 `find("8?a")`（Lua 里 `8?` 是「可选的 8」，实际只要求第 6 字节是 `a`）改成 `== "87a" or == "89a"`；真机样本全是 jpeg/webp ⇒ 上面每条数字都不受影响。补完后平板与源仓**逐文件 md5 全 17 个一致**（`browser.lua` = `5015d9f3…`），重启后 logcat 零条 KOReader 侧 error（只剩 `com.google.android.gms` 的 `ERR_TIMED_OUT`，与本应用无关）、`Lua error` 0 条。
+- 对账与收尾：源仓 `de437a7`（代码 + 用例）+ `ff88f05`（文档），**公开快照 r10 已于 2026-09-28 推送**（`main`=`d1c492f`，快进、CI 双绿、逐 blob 对拍通过）。点验之后只补了一处**等价收紧**——GIF 魔数从 `find("8?a")`（Lua 里 `8?` 是「可选的 8」，实际只要求第 6 字节是 `a`）改成 `== "87a" or == "89a"`；真机样本全是 jpeg/webp ⇒ 上面每条数字都不受影响。补完后平板与源仓**逐文件 md5 全 17 个一致**（`browser.lua` = `5015d9f3…`），重启后 logcat 零条 KOReader 侧 error（只剩 `com.google.android.gms` 的 `ERR_TIMED_OUT`，与本应用无关）、`Lua error` 0 条。
 
 ## 依赖关系
 

@@ -17,7 +17,17 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 VENDOR="$ROOT/rust/ezvjs-bridge/vendor/quickjs"
 OUTDIR="$ROOT/src/koreader-plugin/ezvenera.koplugin/lib"
-TARGET="${1:-host}"
+# 与 fetch-quickjs.sh 同一套解析（M11 教训）：头注释宣传的写法是
+# `--target x86_64`，而旧实现只取 "$1" ⇒ TARGET 被钉成字面量 "--target"，
+# 直接落进 usage 分支。两种写法（`--target X` 与裸 `X`）现在都吃。
+TARGET=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --target) TARGET="$2"; shift 2 ;;
+        *) TARGET="$1"; shift ;;
+    esac
+done
+TARGET="${TARGET:-host}"
 
 if [ "$TARGET" = "host" ] || [ "$TARGET" = "x86_64" ]; then
     echo "[build] host/x86_64 target"

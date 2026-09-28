@@ -368,6 +368,19 @@ function tests.pump_respects_job_cap()
     return true
 end
 
+function tests.pump_job_cap_is_total_across_both_drain_rounds()
+    -- Y2 补的第二轮必须从**总额**里扣预算。不传 max_jobs 时旧写法给第二轮
+    -- 传 nil ⇒ 又跑满一遍上限 ⇒ 单拍 2×PUMP_MAX_JOBS（低配设备上就是 2× 阻塞）
+    local seen = 0
+    local host = makePumpHost(function(i) seen = i; return 1 end)
+    local executed, drained = host:pump()
+    assert_eq("capped at PUMP_MAX_JOBS", JsHost.PUMP_MAX_JOBS, executed)
+    assert_eq("两轮合计的调用数就是上限", JsHost.PUMP_MAX_JOBS, seen)
+    assert_eq("reports not drained", false, drained)
+    host:dispose()
+    return true
+end
+
 function tests.pump_job_error_consumes_exception()
     local consumed = false
     local host = makePumpHost(function(i) return i == 1 and 1 or -1 end)
@@ -486,6 +499,44 @@ function tests.register_source_patches_load_setting_defaults()
         "wrapper must tolerate sources without a settings block")
     assert(src:find('return "";', 1, true),
         "wrapper must fall back to empty string, never null")
+    return true
+end
+
+--- Y2（核实报告 §2）：timers 之后补一轮 job 排空——
+--- 调用序列 1,0,1,0：第一轮吃 job1，第二轮吃 job2（模拟 timer 兑现塞续体）
+function tests.pump_drains_jobs_after_timers()
+    local host = makePumpHost(function(i)
+        return (i == 1 or i == 3) and 1 or 0 end)
+    local executed, drained = host:pump()
+    assert_eq("两轮各吃一个 job", 2, executed)
+    assert_eq("最终排空", true, drained)
+    host:dispose()
+    return true
+end
+
+--- Y3（核实报告 §2）：poll 打包返回 "fired|errors|dropped" 的 Lua 解析
+function tests.poll_parses_packed_diag_and_warns()
+    -- logwarn 的 logger 是 jshost 模块加载期捕获的，测试中途换桩无效——
+    -- 这里只钉 Lua 解析（fired），warn 行为属 3 行外壳不做断言
+    local fake = makePumpFakeLib(function() return 0 end)
+    -- _evalRaw 路径：JS_Eval 返回 float64 值，JS_ToCStringLen2 出打包串
+    fake.JS_Eval = function(_, code)
+        if tostring(code):find("__ezv_poll_timers", 1, true) then
+            return { tag = 7, u = { float64 = 0 } }
+        end
+        return { tag = 3, u = { int32 = 0 } }
+    end
+    fake.JS_ToCStringLen2 = function()
+        local okc, cs = pcall(require, "ffi")
+        if okc then return cs.new("char[?]", 8, "2|1|3") end
+        return nil
+    end
+    local fakeshim = { ezv_install_bridge = function() return 0 end }
+    local host = makeHost({ lib = fake, shim = fakeshim })
+    assert_true("init ok", host:init(makeBridge(), minijson, nil))
+    local fired = host:_pollTimers()
+    assert_eq("fired 解析（打包串 2|1|3 的首段）", 2, fired)
+    host:dispose()
     return true
 end
 

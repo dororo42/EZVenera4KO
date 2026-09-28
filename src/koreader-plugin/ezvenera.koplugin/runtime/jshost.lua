@@ -174,19 +174,28 @@ function __ezv_pending_count() {
     return n;
 }
 function __ezv_poll_timers(now_ms) {
-    var fired = 0;
+    // 返回 "fired|errors|dropped" 打包串——单次 eval 带回全部诊断，
+    // 不额外增加每拍 eval 数（r10 的 eval 计数契约）。
+    // 计数必须是**本拍局部**的：挂全局再于循环开头取走，报的就是上一拍的
+    // 数；而 Y3 要抓的「自续 interval 重挂前抛错 ⇒ 链断」恰恰意味着没有
+    // 下一拍，那条错误会永远进不了日志（2026-09-28 node 真跑 glue 抓到）。
+    var fired = 0, errs = 0, dropped = 0;
     var remain = [];
     for (var i = 0; i < __ezv_timers.length; i++) {
         var t = __ezv_timers[i];
         if (t.at <= now_ms && typeof t.fn === "function" && fired < 64) {
             fired++;
-            try { t.fn(t); } catch (e) {}
+            try { t.fn(t); } catch (e) { errs++; }
+        } else if (typeof t.fn !== "function" && t.at <= now_ms - 60000) {
+            // Y3：直接调 sendMessage({delay}) 而从不 .then 的插件，
+            // 条目 60s 后丢弃——防 __ezv_timers 永久泄漏
+            dropped++;
         } else {
             remain.push(t);
         }
     }
     __ezv_timers = remain;
-    return fired;
+    return fired + "|" + errs + "|" + dropped;
 }
 ]=]
 
@@ -297,10 +306,9 @@ local function probeLib()
     local candidates = {
         "libquickjs",  -- 链接器默认路径 = APK lib/arm64（T-S3 分发的匹配引擎）
         "quickjs",
-        "ezvenera/libquickjs",
     }
     -- 【真机崩溃 RCA 2026-09-25】插件目录候选已**整体移除**：
-    -- package.cpath 含 <plugin>/lib/?.so（pluginloader.lua:243），一旦
+    -- 探测候选中的显式绝对路径（<plugin>/lib/libquickjs.so）一旦
     -- 设备上残留旧版 libquickjs.so（如 2026-09-22 的 857KB 本地产物），
     -- 它会以同名遮蔽 APK 注入的匹配引擎——旧引擎 + 新泵双参 ABI =
     -- SIGSEGV fault addr 0x0（tombstone：#00 libquickjs+e3f8 ← #01
@@ -336,7 +344,6 @@ local function probeShim()
     -- shim/引擎版本错配（与 probeLib 同一根因，2026-09-25 真机 SIGSEGV）
     local candidates = {
         "libezvbridge",   -- 链接器默认路径 = APK lib/arm64
-        "ezvenera/libezvbridge",
     }
     for _, name in ipairs(candidates) do
         local ok, lib = pcall(ffi.load, name)
@@ -711,7 +718,16 @@ function JsHost:_drainJobs(max_jobs)
         local ok, rc = pcall(function()
             return self.lib.JS_ExecutePendingJob(self.rt, pctx)
         end)
-        if not ok or rc == nil then return executed, true end
+        if not ok or rc == nil then
+            -- N6（核实报告 §3）：FFI 层失败按排空结束但留痕（单次，
+            -- 桩环境缺符号时不逐拍刷屏）
+            if not self._drain_fail_warned then
+                self._drain_fail_warned = true
+                logwarn("ezvenera pump: JS_ExecutePendingJob failed:",
+                    not ok and tostring(rc) or "nil return")
+            end
+            return executed, true
+        end
         if rc == 0 then return executed, true end
         if rc < 0 then
             self:_consumeJobError()
@@ -729,12 +745,22 @@ JsHost.EZV_TIMERS_PER_PUMP = 64
 --- 注册（then() 挂回调），这里按 due 触发。eval 缺失（单测桩）时安全为 0。
 function JsHost:_pollTimers()
     if not (self.initialized and self.ctx) then return 0 end
-    local ok, fired = pcall(function()
+    local ok, packed = pcall(function()
         local okr, res = self:_evalRaw("__ezv_poll_timers(Date.now())")
-        if okr and res ~= nil then return tonumber(res) or 0 end
-        return 0
+        if okr and res ~= nil then return tostring(res) end
+        return "0|0|0"
     end)
     if not ok then return 0 end
+    -- Y3（核实报告 §2）："fired|errors|dropped" 打包解析——零额外 eval。
+    -- 注意：桩环境的 canned 返回可能没有分隔符，按 0 处理。
+    local fired, errs, dropped = packed:match("^(%d+)|(%d+)|(%d+)$")
+    fired = tonumber(fired) or 0
+    errs = tonumber(errs) or 0
+    dropped = tonumber(dropped) or 0
+    if errs > 0 or dropped > 0 then
+        logwarn("ezvenera timers: fired=", fired,
+            " errors=", errs, " dropped=", dropped)
+    end
     return fired
 end
 
@@ -748,7 +774,15 @@ function JsHost:pump(max_jobs)
     self:_deliverHttp()
     local executed, drained = self:_drainJobs(max_jobs)
     local fired = self:_pollTimers()
-    return executed, drained and (fired < self.EZV_TIMERS_PER_PUMP)
+    -- Y2（核实报告 §2）：timer 回调可能 resolve promise（塞续体），
+    -- 补一轮排空——否则续体要等下一拍（空闲 0.5s）才跑。
+    -- 预算必须从**总额**里扣：不传 max_jobs 时若照原样传 nil，
+    -- 两轮各跑满上限 = 单拍 2×PUMP_MAX_JOBS，低配设备上就是 2× 阻塞时长。
+    local budget = max_jobs or self.PUMP_MAX_JOBS
+    local executed2, drained2 = self:_drainJobs(
+        executed < budget and (budget - executed) or 0)
+    return executed + executed2,
+        drained and drained2 and (fired < self.EZV_TIMERS_PER_PUMP)
 end
 
 --- job 抛错（JS_ExecutePendingJob 返回 -1）：读出挂起异常并记日志，
@@ -1093,5 +1127,9 @@ function JsHost:dispose()
     if self.rt then self.lib.JS_FreeRuntime(self.rt) self.rt = nil end
     self.initialized = false
 end
+
+--- 供行为测试（tests/test_glue_real.lua）在真 quickjs 里执行 glue——
+--- 字符串模式断言只能锁结构，语义（thenable/排空/上限）必须真机执行。
+JsHost.QUICKJS_GLUE = QUICKJS_GLUE
 
 return JsHost

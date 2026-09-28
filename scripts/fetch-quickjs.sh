@@ -62,6 +62,9 @@ fi
 tar xzf "$TARBALL" -C "$TMP"
 
 EXTRACTED="$(echo "$TMP"/quickjs-*)"
+# vendor/ 是 gitignore 的（.gitignore H4），干净检出（CI）里连父目录都不存在，
+# 旧写法直接 mv 报 "No such file or directory" ⇒ CI 宿主 quickjs 步骤必红。
+mkdir -p "$(dirname "$DEST")"
 rm -rf "$DEST"
 mv "$EXTRACTED" "$DEST"
 rm -rf "$TMP"

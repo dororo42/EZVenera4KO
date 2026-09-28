@@ -303,7 +303,9 @@ function ProxyConf.buildMenu(settings, ui)
             end,
             keep_menu_open = true,
             help_text = "KOReader 原生全局代理只对部分请求路径生效；"
-                .. "本插件的流量始终走上面的插件级代理设置。",
+                .. "本插件的流量始终走上面的插件级代理设置。"
+                .. "注意：接管期间若另行修改 KOReader 原生代理，"
+                .. "关闭同步时会恢复为接管前的快照（N7）。",
         },
     }
     return items
